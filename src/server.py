@@ -31,6 +31,17 @@ PANDAL_UPDATES_FILE = (
     BASE_DIR / "data" / "dynamic" / "pandal_updates_2026.json"
 )
 
+PUJA_SCHEDULE_FILE = (
+    BASE_DIR / "data" / "static" / "puja_schedule_2026.json"
+)
+
+OFFICIAL_PANDAL_PAGES_FILE = (
+    BASE_DIR
+    / "data"
+    / "static"
+    / "official_pandal_facebook_pages_2026.json"
+)
+
 # Production routing services.
 # Point these to your own/private routing services in production.
 OSRM_URL = os.environ.get("OSRM_URL", "https://router.project-osrm.org").rstrip("/")
@@ -75,6 +86,36 @@ with open(RESTAURANT_FILE, "r", encoding="utf-8") as f:
 with open(PLANNED_ROUTES_FILE, "r", encoding="utf-8") as f:
     planned_routes = json.load(f)
 
+with open(PUJA_SCHEDULE_FILE, "r", encoding="utf-8") as f:
+    puja_schedule_data = json.load(f)
+
+with open(OFFICIAL_PANDAL_PAGES_FILE, "r", encoding="utf-8") as f:
+    official_pandal_pages_data = json.load(f)
+
+official_pandal_pages_by_id = {}
+
+for record in official_pandal_pages_data["records"]:
+    if not isinstance(record, dict):
+        continue
+
+    pandal_id = str(record.get("pandal_id", "")).strip()
+    facebook_url = record.get("facebook_page")
+
+    if (
+        pandal_id
+        and record.get("facebook_verified") is True
+        and isinstance(facebook_url, str)
+        and facebook_url.startswith("https://www.facebook.com/")
+    ):
+        official_pandal_pages_by_id[pandal_id.casefold()] = {
+            "pandal_id": pandal_id,
+            "pandal_name": record.get("pandal_name"),
+            "facebook_page": facebook_url,
+            "verified_at": record.get("verified_at"),
+            "verification_source": record.get(
+                "verification_source"
+            ),
+        }
 
 def validate_records(records, record_type: str, required_fields=("id", "name", "latitude", "longitude")) -> None:
     """Validate dataset records before the MCP server starts.
@@ -240,6 +281,15 @@ def restaurants_resource() -> str:
     reservation availability.
     """
     return json.dumps(restaurants, ensure_ascii=False, indent=2)
+
+@mcp.resource("puja://2026/schedule")
+def puja_schedule_resource() -> str:
+    """Expose the local 2026 Puja ritual schedule and its sources."""
+    return json.dumps(
+        puja_schedule_data,
+        ensure_ascii=False,
+        indent=2,
+    )
 
 @mcp.tool()
 def get_pandal_details(pandal_id: str) -> dict:
@@ -3333,4 +3383,265 @@ def get_latest_pandal_update(pandal_name: str) -> dict:
             f"No dynamic Facebook record found for pandal "
             f"named '{pandal_name}'. Use the exact pandal name."
         )
+    }
+
+@mcp.tool()
+def get_puja_schedule(
+    query: str = "",
+    event_date: str = "",
+) -> dict:
+    """
+    Search the Kolkata Durga Puja 2026 general ritual schedule.
+
+    MUST be used for questions about ritual dates and timing windows,
+    including Mahalaya, Shashthi, Saptami, Anjali, Pushpanjali,
+    Kumari Puja, Sandhi Puja, Bhog, Aarti and Vijaya Dashami.
+
+    Use query for a ritual or festival name.
+    Use event_date in YYYY-MM-DD format when a date is specified.
+
+    Preserve separate Panjika traditions and their different times.
+    Return source information with matching records.
+    Do not invent dates or exact timings.
+
+    Individual pandal schedules must be verified separately.
+    Do not present a general Panjika timing as a confirmed local
+    pandal schedule.
+
+    For questions about exact ritual timings at a nearby pandal,
+    also use get_nearby_pandal_official_pages() to find its
+    verified official Facebook page.
+
+    Combine the general Panjika timing with the official page
+    in the final answer. Clearly distinguish general timing
+    from confirmed local timing.
+
+    Never claim that a pandal will publish its schedule at a
+    particular time unless a verified source supports that claim.
+    """
+
+    query_text = str(query or "").strip().casefold()
+    date_text = str(event_date or "").strip()
+
+    ignored_words = {
+        "what", "when", "where", "is", "are", "the", "a", "an",
+        "for", "to", "of", "at", "on", "in", "me", "please",
+        "tell", "show", "give", "find", "get", "schedule",
+        "timing", "timings", "time", "date", "dates", "about",
+        "puja", "ritual", "2026", "during", "according", "each",
+        "panjika", "window", "windows","maha", "this", "year", 
+        "heard", "differs", "between", "usual", "usually", "kolkata",
+    }
+
+    query_terms = [
+        word
+        for word in re.findall(r"[a-z0-9]+", query_text)
+        if word not in ignored_words
+    ]
+
+    def record_matches(record: dict) -> bool:
+        record_text = json.dumps(
+            record,
+            ensure_ascii=False,
+        ).casefold()
+
+        if date_text and date_text not in record_text:
+            return False
+
+        return all(term in record_text for term in query_terms)
+
+    def collect_source_ids(value) -> list[str]:
+        found = []
+
+        if isinstance(value, dict):
+            source_id = value.get("source_id")
+            if isinstance(source_id, str):
+                found.append(source_id)
+
+            source_ids = value.get("source_ids")
+            if isinstance(source_ids, list):
+                found.extend(
+                    item for item in source_ids
+                    if isinstance(item, str)
+                )
+
+            for child in value.values():
+                found.extend(collect_source_ids(child))
+
+        elif isinstance(value, list):
+            for child in value:
+                found.extend(collect_source_ids(child))
+
+        return list(dict.fromkeys(found))
+
+    sources_by_id = {
+        source["source_id"]: source
+        for source in puja_schedule_data.get("sources", [])
+        if isinstance(source, dict) and source.get("source_id")
+    }
+
+    festival_results = [
+        record
+        for record in puja_schedule_data.get("festival_dates", [])
+        if isinstance(record, dict) and record_matches(record)
+    ]
+
+    ritual_results = [
+        record
+        for record in puja_schedule_data.get("rituals", [])
+        if isinstance(record, dict) and record_matches(record)
+    ]
+
+    matched_records = festival_results + ritual_results
+
+    results = []
+    for record in matched_records:
+        source_ids = collect_source_ids(record)
+        results.append({
+            "record": record,
+            "sources": [
+                sources_by_id[source_id]
+                for source_id in source_ids
+                if source_id in sources_by_id
+            ],
+        })
+
+    return {
+        "dataset": puja_schedule_data.get("dataset_name"),
+        "timezone": puja_schedule_data.get("timezone", "Asia/Kolkata"),
+        "query": query,
+        "event_date": event_date,
+        "result_count": len(results),
+        "results": results,
+        "source_policy": puja_schedule_data.get("source_policy", {}),
+        "message": (
+            "Matching schedule records found."
+            if results
+            else (
+                "No matching schedule was found in the dataset. "
+                "Do not guess a date or time."
+            )
+        ),
+    }
+
+@mcp.tool()
+def get_nearby_pandal_official_pages(
+    latitude: float,
+    longitude: float,
+    limit: int = 5,
+) -> dict:
+    """
+    Find nearby Kolkata Durga Puja pandals and their verified
+    official Facebook pages.
+
+    MUST be used when a user asks for the nearest pandal's
+    official page or needs an official link for an exact local
+    Puja schedule.
+
+    Use the user's supplied coordinates or coordinates resolved
+    from a matching record in the local pandal dataset.
+    Never guess coordinates.
+
+    Only return Facebook URLs marked facebook_verified=true
+    in the official-page mapping.
+
+    A verified page does not prove that the exact ritual timing
+    has been published. Do not invent a local schedule.
+
+    Distances are straight-line geographic distances, not
+    walking or road distances.
+
+    When the user asks about a ritual at a nearby pandal,
+    also use get_puja_schedule() to retrieve the general
+    Panjika timing.
+
+    Return the complete verified Facebook URL when available.
+    Do not invent exact local ritual times.
+    """
+
+    if not (
+        math.isfinite(latitude)
+        and -90 <= latitude <= 90
+    ):
+        return {"error": "Invalid latitude."}
+
+    if not (
+        math.isfinite(longitude)
+        and -180 <= longitude <= 180
+    ):
+        return {"error": "Invalid longitude."}
+
+    if not isinstance(limit, int) or not 1 <= limit <= 10:
+        return {"error": "limit must be between 1 and 10."}
+
+    results = []
+
+    for pandal in pandals:
+        try:
+            pandal_lat = float(pandal["latitude"])
+            pandal_lon = float(pandal["longitude"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if (
+            not math.isfinite(pandal_lat)
+            or not math.isfinite(pandal_lon)
+            or not -90 <= pandal_lat <= 90
+            or not -180 <= pandal_lon <= 180
+        ):
+            continue
+
+        distance_km = haversine_distance(
+            latitude,
+            longitude,
+            pandal_lat,
+            pandal_lon,
+        )
+
+        page = official_pandal_pages_by_id.get(
+            str(pandal.get("id", "")).strip().casefold()
+        )
+
+        results.append({
+            "pandal_id": pandal.get("id"),
+            "pandal_name": pandal.get("name"),
+            "area": pandal.get("area"),
+            "address": pandal.get("address"),
+            "distance_km": round(distance_km, 2),
+            "distance_type": "straight_line_geographic",
+            "official_facebook_page": (
+                page["facebook_page"] if page else None
+            ),
+            "facebook_verified": page is not None,
+            "page_verified_at": (
+                page["verified_at"] if page else None
+            ),
+        })
+
+    results.sort(key=lambda item: item["distance_km"])
+
+    nearest = results[:limit]
+
+    nearest_with_page = next(
+        (
+            item for item in results
+            if item["facebook_verified"]
+        ),
+        None,
+    )
+
+    return {
+        "status": "success",
+        "user_location": {
+            "latitude": latitude,
+            "longitude": longitude,
+        },
+        "nearest_pandals": nearest,
+        "nearest_pandal_with_verified_page": nearest_with_page,
+        "message": (
+            "These are the closest pandals by straight-line distance. "
+            "Only verified Facebook URLs are provided. Check the page "
+            "for a published ritual schedule; an exact local time is "
+            "not guaranteed to be available."
+        ),
     }
