@@ -5,6 +5,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlencode
 from datetime import datetime, timezone, timedelta
 
 from pathlib import Path
@@ -45,6 +46,21 @@ ROUTE_CACHE_VERSION = os.environ.get("ROUTE_CACHE_VERSION", "2026-10-07-optimiza
 
 # In-process cache. For multiple MCP instances, replace with shared Redis.
 ROUTE_CACHE: dict[tuple, tuple[float, dict]] = {}
+
+# Open-Meteo weather forecast configuration
+OPEN_METEO_URL = os.environ.get(
+    "OPEN_METEO_URL",
+    "https://api.open-meteo.com/v1/forecast"
+)
+
+WEATHER_CACHE_TTL_SECONDS = int(
+    os.environ.get("WEATHER_CACHE_TTL_SECONDS", "600")
+)
+
+WEATHER_CACHE = {}
+WEATHER_BATCH_SIZE = 20
+
+KOLKATA_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 # Load static data
 with open(PANDAL_FILE, "r", encoding="utf-8") as f:
@@ -2363,29 +2379,350 @@ def get_planned_puja_routes() -> list[dict]:
     """
     return planned_routes
 
+def _weather_location_key(latitude: float, longitude: float) -> str:
+    return f"{float(latitude):.5f},{float(longitude):.5f}"
+
+
+def fetch_weather_for_locations(
+    locations: list[dict],
+    forecast_hours: int = 8
+) -> dict:
+    """
+    Fetch hourly rainfall forecasts for multiple pandal coordinates.
+
+    Forecast assessment is based on the next forecast_hours at each
+    pandal location, not on every road segment between pandals.
+    """
+
+    if not 1 <= forecast_hours <= 24:
+        return {
+            "status": "error",
+            "error": "forecast_hours must be between 1 and 24."
+        }
+
+    now_ist = datetime.now(KOLKATA_TIMEZONE)
+    now_local = now_ist.replace(tzinfo=None)
+
+    window_start = now_local.replace(
+        minute=0, second=0, microsecond=0
+    )
+    window_end = window_start + timedelta(hours=forecast_hours)
+
+    def unavailable(message: str) -> dict:
+        return {
+            "status": "unavailable",
+            "error": message,
+            "source": "Open-Meteo"
+        }
+
+    # Deduplicate locations by coordinate.
+    unique_locations = {}
+
+    try:
+        for location in locations:
+            latitude = float(location["latitude"])
+            longitude = float(location["longitude"])
+
+            if (
+                not math.isfinite(latitude)
+                or not math.isfinite(longitude)
+                or not -90 <= latitude <= 90
+                or not -180 <= longitude <= 180
+            ):
+                return {
+                    "status": "error",
+                    "error": "A location has invalid coordinates."
+                }
+
+            key = _weather_location_key(latitude, longitude)
+            unique_locations.setdefault(
+                key, (latitude, longitude)
+            )
+
+    except (KeyError, TypeError, ValueError):
+        return {
+            "status": "error",
+            "error": "Invalid location records."
+        }
+
+    if not unique_locations:
+        return unavailable("No candidate pandal locations were supplied.")
+
+    # Remove expired cache entries.
+    monotonic_now = time.monotonic()
+
+    for cache_key, (cached_at, _) in list(WEATHER_CACHE.items()):
+        if monotonic_now - cached_at > WEATHER_CACHE_TTL_SECONDS:
+            WEATHER_CACHE.pop(cache_key, None)
+
+    forecasts_by_location = {}
+    pending = []
+
+    # Reuse fresh forecasts; fetch only uncached coordinates.
+    for key, (latitude, longitude) in unique_locations.items():
+        cache_key = (
+            key,
+            window_start.isoformat(),
+            forecast_hours
+        )
+
+        cached = WEATHER_CACHE.get(cache_key)
+
+        if cached is not None:
+            forecasts_by_location[key] = cached[1]
+        else:
+            pending.append(
+                (key, latitude, longitude, cache_key)
+            )
+
+    # Open-Meteo supports multiple coordinates per request.
+    for offset in range(0, len(pending), WEATHER_BATCH_SIZE):
+        batch = pending[offset:offset + WEATHER_BATCH_SIZE]
+
+        params = {
+            "latitude": ",".join(
+                f"{item[1]:.5f}" for item in batch
+            ),
+            "longitude": ",".join(
+                f"{item[2]:.5f}" for item in batch
+            ),
+            "hourly": (
+                "precipitation_probability,precipitation,rain"
+            ),
+            "forecast_days": 2,
+            "timezone": "Asia/Kolkata"
+        }
+
+        url = f"{OPEN_METEO_URL}?{urlencode(params)}"
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Kolkata-Puja-Tourist-MCP/1.0"
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                payload = json.loads(
+                    response.read().decode("utf-8")
+                )
+
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+            UnicodeDecodeError
+        ) as exc:
+            for key, _, _, _ in batch:
+                forecasts_by_location[key] = unavailable(
+                    f"Weather request failed: {exc}"
+                )
+            continue
+
+        if isinstance(payload, list):
+            response_items = payload
+        elif isinstance(payload, dict) and len(batch) == 1:
+            response_items = [payload]
+        else:
+            response_items = []
+
+        # Multiple-coordinate responses must match the requested order.
+        if len(response_items) != len(batch):
+            for key, _, _, _ in batch:
+                forecasts_by_location[key] = unavailable(
+                    "Weather response did not match the requested locations."
+                )
+            continue
+
+        for item, (key, latitude, longitude, cache_key) in zip(
+            response_items, batch
+        ):
+            hourly = item.get("hourly", {})
+
+            times = hourly.get("time", [])
+            probabilities = hourly.get(
+                "precipitation_probability", []
+            )
+            precipitation = hourly.get("precipitation", [])
+            rain_values = hourly.get("rain", [])
+
+            selected_hours = []
+
+            for index, timestamp in enumerate(times):
+                try:
+                    forecast_time = datetime.fromisoformat(timestamp)
+
+                    if forecast_time.tzinfo is not None:
+                        forecast_time = (
+                            forecast_time
+                            .astimezone(KOLKATA_TIMEZONE)
+                            .replace(tzinfo=None)
+                        )
+
+                except (TypeError, ValueError):
+                    continue
+
+                if not window_start <= forecast_time < window_end:
+                    continue
+
+                probability = (
+                    probabilities[index]
+                    if index < len(probabilities) else None
+                )
+                precipitation_mm = (
+                    precipitation[index]
+                    if index < len(precipitation) else None
+                )
+                rain_mm = (
+                    rain_values[index]
+                    if index < len(rain_values) else None
+                )
+
+                selected_hours.append({
+                    "time": timestamp,
+                    "probability": probability,
+                    "precipitation_mm": precipitation_mm,
+                    "rain_mm": rain_mm
+                })
+
+            if not selected_hours:
+                forecasts_by_location[key] = unavailable(
+                    "No hourly forecasts were returned for the requested window."
+                )
+                continue
+
+            probability_values = [
+                hour["probability"]
+                for hour in selected_hours
+                if isinstance(hour["probability"], (int, float))
+            ]
+
+            precipitation_values = [
+                hour["precipitation_mm"]
+                for hour in selected_hours
+                if isinstance(hour["precipitation_mm"], (int, float))
+            ]
+
+            rain_hour_count = sum(
+                1 for hour in selected_hours
+                if (
+                    (
+                        isinstance(hour["probability"], (int, float))
+                        and hour["probability"] >= 50
+                    )
+                    or (
+                        isinstance(hour["precipitation_mm"], (int, float))
+                        and hour["precipitation_mm"] >= 0.1
+                    )
+                    or (
+                        isinstance(hour["rain_mm"], (int, float))
+                        and hour["rain_mm"] >= 0.1
+                    )
+                )
+            )
+
+            if not probability_values and not precipitation_values:
+                forecasts_by_location[key] = unavailable(
+                    "Forecast contained no usable rain values."
+                )
+                continue
+
+            result = {
+                "status": "success",
+                "source": "Open-Meteo",
+                "latitude": latitude,
+                "longitude": longitude,
+                "forecast_hours": forecast_hours,
+                "rain_expected": rain_hour_count > 0,
+                "rain_signal_hours": rain_hour_count,
+                "mean_precipitation_probability_percent": (
+                    round(sum(probability_values) / len(probability_values), 1)
+                    if probability_values else None
+                ),
+                "max_precipitation_probability_percent": (
+                    max(probability_values)
+                    if probability_values else None
+                ),
+                "total_forecast_precipitation_mm": round(
+                    sum(precipitation_values), 2
+                ),
+                "forecast_window_start_local": window_start.isoformat(),
+                "forecast_window_end_local": window_end.isoformat()
+            }
+
+            WEATHER_CACHE[cache_key] = (
+                time.monotonic(),
+                result
+            )
+
+            forecasts_by_location[key] = result
+
+    statuses = [
+        forecast.get("status")
+        for forecast in forecasts_by_location.values()
+    ]
+
+    if statuses and all(status == "success" for status in statuses):
+        overall_status = "success"
+    elif any(status == "success" for status in statuses):
+        overall_status = "partial"
+    else:
+        overall_status = "unavailable"
+
+    return {
+        "status": overall_status,
+        "source": "Open-Meteo",
+        "forecast_hours": forecast_hours,
+        "forecast_window_start_local": window_start.isoformat(),
+        "forecast_window_end_local": window_end.isoformat(),
+        "locations": forecasts_by_location,
+        "limitations": (
+            "Forecasts describe weather at pandal coordinates, not every "
+            "road segment. They do not establish flooding, road closures, "
+            "or whether a route is safe."
+        )
+    }
+
 @mcp.tool()
 def recommend_puja_route(
     latitude: float,
     longitude: float
 ) -> dict:
     """
-    Recommend the most suitable planned Puja route from a user's location.
+    Recommend a planned Kolkata Puja route using proximity and weather.
 
     Selection logic:
-    - For each planned route, find the pandal closest to the user using
-      straight-line geographic distance.
-    - Select the route with the closest pandal.
-    - Reorder that route so the nearest pandal becomes the first stop.
-    - Preserve the original planned-route order after that first stop.
+    - Find planned routes and rotate each route to start at its nearest
+      pandal relative to the user's location.
+    - Fetch hourly rain forecasts for pandal stops on candidate routes.
+    - When rain is forecast and all candidate forecasts are complete,
+      rank routes by rain exposure, precipitation probability, and
+      forecast precipitation.
+    - Use planned duration and proximity as tie-breakers.
+    - If weather data is unavailable or incomplete, retain the original
+      nearest-pandal selection rule.
 
-    Important:
-    - Distance used for route selection is straight-line distance.
-    - This tool does NOT calculate walking distance.
-    - This tool does NOT optimize the route for shortest driving distance.
-    - The original planned-route order is preserved after rotation.
-    - The actual driving route should be calculated with plan_puja_route().
+    WEATHER INTERPRETATION
+    - Base route selection explanations only on the returned
+      weather_context, weather_assessment, and selection_reason.
+    - Do not claim weather changed the recommendation unless
+      weather_adjustment_applied is true.
+    - A user's hypothetical assumption that it is raining does
+      not override the actual forecast returned by the weather tool.
+    - If the user requests a hypothetical rainy scenario, explain
+      that the production recommendation uses forecast data.
+    - Never claim a route is sheltered, flood-free, or safer
+      unless reliable data supports that claim.    
+
+    OSRM remains responsible for calculating actual driving routes.
+    Weather forecasts do not establish flooding, road closures, or
+    road safety. This tool does not optimize OSRM driving distances.
     """
 
+    # ---------------------------------------------------------
+    # 1. Validate the user's coordinates.
+    # ---------------------------------------------------------
     if not (-90 <= latitude <= 90):
         return {
             "status": "error",
@@ -2398,7 +2735,9 @@ def recommend_puja_route(
             "message": "Longitude must be between -180 and 180."
         }
 
-    # Fast lookup from the 224-pandal master dataset.
+    # ---------------------------------------------------------
+    # 2. Build a fast lookup of the pandal dataset.
+    # ---------------------------------------------------------
     pandal_by_id = {
         str(p["id"]).strip().lower(): p
         for p in pandals
@@ -2406,6 +2745,9 @@ def recommend_puja_route(
 
     route_candidates = []
 
+    # ---------------------------------------------------------
+    # 3. Build each candidate route, preserving its planned order.
+    # ---------------------------------------------------------
     for route in planned_routes:
         route_id = route.get("route_id")
         route_name = route.get("route_name")
@@ -2414,7 +2756,6 @@ def recommend_puja_route(
         if not route_id or not route_name:
             continue
 
-        # Keep only IDs that exist in the master pandal dataset.
         valid_route_ids = [
             pandal_id
             for pandal_id in route_pandal_ids
@@ -2428,9 +2769,10 @@ def recommend_puja_route(
         nearest_pandal = None
         nearest_distance = float("inf")
 
-        # Find the nearest pandal for this route.
         for index, pandal_id in enumerate(valid_route_ids):
-            pandal = pandal_by_id[str(pandal_id).strip().lower()]
+            pandal = pandal_by_id[
+                str(pandal_id).strip().lower()
+            ]
 
             distance = haversine_distance(
                 latitude,
@@ -2447,27 +2789,28 @@ def recommend_puja_route(
         if nearest_pandal is None or nearest_index is None:
             continue
 
-        # Rotate the original route so the nearest pandal is first.
+        # Rotate the original route to start at its nearest pandal.
         recommended_pandal_ids = (
             valid_route_ids[nearest_index:]
             + valid_route_ids[:nearest_index]
         )
 
-        # Build detailed stops with both ID and name.
         recommended_stops = []
 
         for stop_number, pandal_id in enumerate(
             recommended_pandal_ids,
             start=1
         ):
-            pandal = pandal_by_id[str(pandal_id).strip().lower()]
+            pandal = pandal_by_id[
+                str(pandal_id).strip().lower()
+            ]
 
             recommended_stops.append({
                 "stop_number": stop_number,
                 "pandal_id": pandal["id"],
                 "pandal_name": pandal["name"],
-                "latitude": pandal["latitude"],
-                "longitude": pandal["longitude"]
+                "latitude": float(pandal["latitude"]),
+                "longitude": float(pandal["longitude"])
             })
 
         route_candidates.append({
@@ -2482,36 +2825,28 @@ def recommend_puja_route(
             },
 
             "distance_to_nearest_pandal_km": round(
-                nearest_distance,
-                2
+                nearest_distance, 2
             ),
-
             "distance_type": "straight_line_geographic",
             "distance_source": "Haversine",
             "route_calculated": False,
 
             "total_stops": len(recommended_stops),
-
             "must_see_count": route.get("must_see_count"),
-
             "estimated_duration_hours": route.get(
                 "estimated_duration_hours"
             ),
 
-            # Full ordered list with names and IDs.
             "recommended_stops": recommended_stops,
-
-            # Useful for passing directly to plan_puja_route().
             "recommended_pandal_ids": recommended_pandal_ids,
 
             "source": route.get("source"),
             "source_url": route.get("source_url"),
 
-            # Explicit facts to prevent unsupported explanations.
             "route_order_strategy": (
                 "Start at the pandal nearest to the user, then continue "
                 "in the original planned-route order. This is a planned "
-                "sequence, not a shortest-route optimization."
+                "sequence, not a shortest-driving-route optimization."
             ),
 
             "route_optimization": {
@@ -2530,9 +2865,15 @@ def recommend_puja_route(
                 "duration_source": "planned_route_source",
                 "duration_is_routing_time": False,
                 "duration_note": (
-                    "The estimated duration is the duration recorded in the "
-                    "planned-route dataset; it is not an OSRM/Valhalla travel-time calculation."
+                    "The estimated duration comes from the planned-route "
+                    "dataset. It is not OSRM driving time or Valhalla "
+                    "walking time."
                 )
+            },
+
+            # Filled in by the weather-assessment step.
+            "weather_assessment": {
+                "status": "pending"
             }
         })
 
@@ -2545,13 +2886,225 @@ def recommend_puja_route(
             )
         }
 
-    # Closest route wins.
-    route_candidates.sort(
-        key=lambda route: route["distance_to_nearest_pandal_km"]
+    # ---------------------------------------------------------
+    # 4. Fetch weather forecasts for all unique candidate stops.
+    # ---------------------------------------------------------
+    weather_locations = [
+        stop
+        for candidate in route_candidates
+        for stop in candidate["recommended_stops"]
+    ]
+
+    weather_context = fetch_weather_for_locations(
+        weather_locations,
+        forecast_hours=8
     )
+
+    forecasts_by_location = weather_context.get(
+        "locations", {}
+    )
+
+    # ---------------------------------------------------------
+    # 5. Calculate a weather assessment for each candidate route.
+    # ---------------------------------------------------------
+    for candidate in route_candidates:
+        stops = candidate["recommended_stops"]
+        stop_forecasts = []
+        unavailable_stops = []
+
+        for stop in stops:
+            location_key = _weather_location_key(
+                stop["latitude"],
+                stop["longitude"]
+            )
+
+            forecast = forecasts_by_location.get(location_key)
+
+            if (
+                isinstance(forecast, dict)
+                and forecast.get("status") == "success"
+                and isinstance(
+                    forecast.get("rain_expected"), bool
+                )
+                and isinstance(
+                    forecast.get(
+                        "total_forecast_precipitation_mm"
+                    ),
+                    (int, float)
+                )
+            ):
+                stop_forecasts.append(forecast)
+            else:
+                unavailable_stops.append(stop["pandal_name"])
+
+        # Do not compare incomplete route forecasts.
+        if not stops or len(stop_forecasts) != len(stops):
+            candidate["weather_assessment"] = {
+                "status": "unavailable",
+                "assessed_stops": len(stop_forecasts),
+                "total_stops": len(stops),
+                "unavailable_stops": unavailable_stops,
+                "reason": (
+                    "Weather data was not available for every "
+                    "pandal on this route."
+                )
+            }
+            continue
+
+        rainy_stops = sum(
+            1
+            for forecast in stop_forecasts
+            if forecast["rain_expected"]
+        )
+
+        probabilities = [
+            forecast[
+                "mean_precipitation_probability_percent"
+            ]
+            for forecast in stop_forecasts
+            if isinstance(
+                forecast.get(
+                    "mean_precipitation_probability_percent"
+                ),
+                (int, float)
+            )
+        ]
+
+        mean_probability = (
+            round(
+                sum(probabilities) / len(probabilities),
+                1
+            )
+            if probabilities else None
+        )
+
+        mean_precipitation = round(
+            sum(
+                float(
+                    forecast["total_forecast_precipitation_mm"]
+                )
+                for forecast in stop_forecasts
+            ) / len(stop_forecasts),
+            2
+        )
+
+        candidate["weather_assessment"] = {
+            "status": "success",
+            "source": "Open-Meteo",
+            "forecast_hours": 8,
+            "total_pandal_stops": len(stops),
+            "rain_signal_stops": rainy_stops,
+            "rain_signal_stop_fraction": round(
+                rainy_stops / len(stops),
+                3
+            ),
+            "mean_precipitation_probability_percent": (
+                mean_probability
+            ),
+            "mean_precipitation_mm_per_stop": (
+                mean_precipitation
+            ),
+            "assessment_basis": (
+                "Forecast rainfall at pandal coordinates during "
+                "the next eight hours. Weather between stops is "
+                "not assessed."
+            )
+        }
+
+    # ---------------------------------------------------------
+    # 6. Decide whether weather can influence route selection.
+    # ---------------------------------------------------------
+    weather_complete = all(
+        candidate["weather_assessment"].get("status") == "success"
+        for candidate in route_candidates
+    )
+
+    rain_expected = (
+        weather_complete
+        and any(
+            candidate["weather_assessment"]["rain_signal_stops"] > 0
+            for candidate in route_candidates
+        )
+    )
+
+    weather_adjustment_applied = False
+
+    def planned_duration_key(route):
+        """Return a numeric duration for tie-breaking."""
+        duration = route.get("estimated_duration_hours")
+
+        try:
+            value = float(duration)
+            if math.isfinite(value) and value >= 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+
+        return float("inf")
+
+    if rain_expected:
+        # Rank by forecast rain exposure first. A lower score is preferred.
+        # Planned duration and proximity only break ties.
+        def weather_route_key(route):
+            assessment = route["weather_assessment"]
+
+            mean_probability = assessment[
+                "mean_precipitation_probability_percent"
+            ]
+
+            probability_key = (
+                float(mean_probability)
+                if mean_probability is not None
+                else float("inf")
+            )
+
+            return (
+                assessment["rain_signal_stop_fraction"],
+                probability_key,
+                assessment["mean_precipitation_mm_per_stop"],
+                planned_duration_key(route),
+                route["distance_to_nearest_pandal_km"]
+            )
+
+        route_candidates.sort(key=weather_route_key)
+        weather_adjustment_applied = True
+
+        selection_reason = (
+            "Rain is forecast at one or more candidate pandal stops. "
+            "Routes were ranked by the proportion of stops with a rain "
+            "signal, mean precipitation probability, and mean forecast "
+            "precipitation per stop. Planned itinerary duration and "
+            "proximity break ties. This does not establish that a route "
+            "is sheltered, flood-free, or safer."
+        )
+
+    else:
+        # Preserve existing behaviour if forecasts are unavailable,
+        # incomplete, or show no configured rain signal.
+        route_candidates.sort(
+            key=lambda route: (
+                route["distance_to_nearest_pandal_km"]
+            )
+        )
+
+        if weather_complete:
+            selection_reason = (
+                "No configured rain signal was detected at the candidate "
+                "pandal stops in the forecast window. The original "
+                "nearest-pandal selection rule was retained."
+            )
+        else:
+            selection_reason = (
+                "Weather data was unavailable or incomplete for one or "
+                "more candidate routes. The original nearest-pandal "
+                "selection rule was retained without weather adjustment."
+            )
 
     recommended = route_candidates[0]
 
+    # ---------------------------------------------------------
+    # 7. Return the recommendation, evidence, and limitations.
+    # ---------------------------------------------------------
     return {
         "status": "success",
 
@@ -2561,13 +3114,37 @@ def recommend_puja_route(
         },
 
         "recommended_route": recommended,
-
         "other_route_options": route_candidates[1:],
 
+        "weather_context": {
+            "status": weather_context.get("status", "unavailable"),
+            "source": "Open-Meteo",
+            "forecast_hours": 8,
+            "forecast_window_start_local": weather_context.get(
+                "forecast_window_start_local"
+            ),
+            "forecast_window_end_local": weather_context.get(
+                "forecast_window_end_local"
+            ),
+            "weather_adjustment_applied": (
+                weather_adjustment_applied
+            ),
+            "limitations": (
+                "Weather is assessed at planned pandal stops, not along "
+                "every road segment. OSRM distances and durations are "
+                "not weather-adjusted. Rain forecasts do not establish "
+                "flooding, road closures, shelter availability, or safety."
+            )
+        },
+
+        "selection_reason": selection_reason,
+
         "usage_note": (
-            "Use plan_puja_route() with recommended_pandal_ids to calculate "
-            "the actual OSRM driving route. Use plan_walking_puja_route() "
-            "with the same IDs to calculate the actual Valhalla walking route."
+            "Use plan_puja_route() with recommended_pandal_ids to "
+            "calculate the actual OSRM driving route. Use "
+            "plan_walking_puja_route() with the same IDs to calculate "
+            "the actual Valhalla walking route. These routing services "
+            "do not automatically account for weather."
         )
     }
 
