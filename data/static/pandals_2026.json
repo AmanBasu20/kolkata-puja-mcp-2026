@@ -2014,5 +2014,41 @@
     "zone": "Outside Kolkata",
     "latitude": 22.58378,
     "longitude": 88.334
+  },
+  {
+    "id": "P225",
+    "name": "Lake Town Adhibasibrinda",
+    "area": "Lake Town",
+    "address": "Lake Town, Kolkata, West Bengal",
+    "zone": "East Kolkata",
+    "latitude": 22.605,
+    "longitude": 88.405
+  },
+  {
+    "id": "P226",
+    "name": "Azad Hind Bagh Sarbojanin",
+    "area": "Azad Hind Bagh",
+    "address": "Azad Hind Bagh, Kolkata, West Bengal",
+    "zone": "North Kolkata",
+    "latitude": 22.58704,
+    "longitude": 88.36825
+  },
+  {
+    "id": "P227",
+    "name": "Young Boys Club",
+    "area": "Colootola",
+    "address": "Colootola, Kolkata, West Bengal",
+    "zone": "Central Kolkata",
+    "latitude": 22.57249,
+    "longitude": 88.35874
+  },
+  {
+    "id": "P228",
+    "name": "Sabarna Roy Choudhury Bari",
+    "area": "Barisha",
+    "address": "Barisha, Kolkata, West Bengal",
+    "zone": "South Kolkata",
+    "latitude": 22.48485,
+    "longitude": 88.31369
   }
 ]
