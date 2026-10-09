@@ -430,5 +430,21 @@
     "longitude": 88.4121618,
     "source": "OpenStreetMap",
     "osm_id": 13088491874
+  },
+  {
+    "id": "M055",
+    "name": "Gitanjali",
+    "latitude": 22.4694741,
+    "longitude": 88.3698385,
+    "source": "Wikipedia/Google Maps",
+    "osm_id": null
+  },
+  {
+    "id": "M056",
+    "name": "Masterda Surya Sen",
+    "latitude": 22.4735212,
+    "longitude": 88.3608711,
+    "source": "Wikipedia/Google Maps",
+    "osm_id": null
   }
 ]
