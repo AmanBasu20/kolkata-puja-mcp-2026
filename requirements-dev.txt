@@ -1,0 +1,9 @@
+# Install all runtime dependencies first
+-r requirements.txt
+
+# Testing
+pytest>=8.0,<10.0
+pytest-cov>=5.0,<8.0
+
+# Linting and code quality
+ruff>=0.9,<1.0
