@@ -1,4 +1,5 @@
 import json
+import heapq
 import math
 import os
 import re
@@ -35,11 +36,31 @@ PUJA_SCHEDULE_FILE = (
     BASE_DIR / "data" / "static" / "puja_schedule_2026.json"
 )
 
+# Official Metro Railway Kolkata special-service schedule for Durga Puja 2026.
+# This is a date-specific notice, not a complete regular timetable.
+METRO_PUJA_SPECIAL_SERVICES_FILE = (
+    BASE_DIR / "data" / "static" / "metro_puja_special_services_2026.json"
+)
+
+# Station graph used by the date-aware Metro-only journey planner.
+# This file is read at query time so network updates do not require code edits.
+METRO_NETWORK_FILE = BASE_DIR / "data" / "static" / "metro_network_2026.json"
+
 OFFICIAL_PANDAL_PAGES_FILE = (
     BASE_DIR
     / "data"
     / "static"
     / "official_pandal_facebook_pages_2026.json"
+)
+
+# Dynamic road-traffic-derived area-busyness snapshots from the TomTom collector.
+# These files are read at query time, so a successful collector refresh is
+# visible without restarting the MCP server.
+CROWD_PANDALS_FILE = BASE_DIR / "data" / "dynamic" / "enriched_pandals.json"
+CROWD_STATIONS_FILE = BASE_DIR / "data" / "dynamic" / "enriched_stations.json"
+CROWD_REFRESH_STATUS_FILE = BASE_DIR / "data" / "dynamic" / "crowd_refresh_status.json"
+CROWD_DATA_MAX_AGE_MINUTES = int(
+    os.environ.get("CROWD_DATA_MAX_AGE_MINUTES", "90")
 )
 
 # Production routing services.
@@ -53,7 +74,7 @@ ROUTE_CACHE_TTL_SECONDS = int(os.environ.get("ROUTE_CACHE_TTL_SECONDS", "300"))
 ROUTE_CACHE_MAX_ENTRIES = int(os.environ.get("ROUTE_CACHE_MAX_ENTRIES", "512"))
 # Bump this when route-output semantics change so stale in-memory results are
 # never reused after a server restart/hot reload cycle.
-ROUTE_CACHE_VERSION = os.environ.get("ROUTE_CACHE_VERSION", "2026-10-07-optimization-comparison-v3")
+ROUTE_CACHE_VERSION = os.environ.get("ROUTE_CACHE_VERSION", "2026-10-10-crowd-context-v1")
 
 # In-process cache. For multiple MCP instances, replace with shared Redis.
 ROUTE_CACHE: dict[tuple, tuple[float, dict]] = {}
@@ -88,6 +109,16 @@ with open(PLANNED_ROUTES_FILE, "r", encoding="utf-8") as f:
 
 with open(PUJA_SCHEDULE_FILE, "r", encoding="utf-8") as f:
     puja_schedule_data = json.load(f)
+
+with open(METRO_PUJA_SPECIAL_SERVICES_FILE, "r", encoding="utf-8") as f:
+    metro_puja_special_services_data = json.load(f)
+
+if not isinstance(metro_puja_special_services_data, dict) or not isinstance(
+    metro_puja_special_services_data.get("lines"), list
+):
+    raise ValueError(
+        "Metro Puja special-services JSON must be an object containing a 'lines' list."
+    )
 
 with open(OFFICIAL_PANDAL_PAGES_FILE, "r", encoding="utf-8") as f:
     official_pandal_pages_data = json.load(f)
@@ -248,6 +279,278 @@ validate_planned_routes(planned_routes, pandals)
 
 # Create the MCP server
 mcp = MCPServer("Kolkata Puja Tourist MCP")
+
+
+# ---------------------------------------------------------------------------
+# Dynamic road-traffic-derived area busyness
+# ---------------------------------------------------------------------------
+def _read_enriched_snapshot(path: Path) -> list[dict] | dict:
+    """Read a current enriched snapshot at query time (no restart required)."""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            records = json.load(f)
+    except FileNotFoundError:
+        return {
+            "status": "unavailable",
+            "error": f"Dynamic busyness data has not been generated yet: {path.name}",
+        }
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "status": "unavailable",
+            "error": f"Could not read dynamic busyness data from {path.name}: {exc}",
+        }
+
+    if not isinstance(records, list):
+        return {
+            "status": "unavailable",
+            "error": f"Unexpected format in {path.name}; expected a JSON list.",
+        }
+    return records
+
+
+def _lookup_enriched_record(records: list[dict], query: str) -> dict:
+    """Resolve by exact ID/name first, then by an unambiguous substring."""
+    needle = str(query or "").strip().casefold()
+    if not needle:
+        return {
+            "status": "error",
+            "error": "A pandal or Metro station name/ID is required.",
+        }
+
+    valid_records = [row for row in records if isinstance(row, dict)]
+    exact = [
+        row for row in valid_records
+        if str(row.get("id", "")).strip().casefold() == needle
+        or str(row.get("name", "")).strip().casefold() == needle
+    ]
+    if len(exact) == 1:
+        return {"status": "found", "record": exact[0]}
+    if len(exact) > 1:
+        return {
+            "status": "ambiguous",
+            "query": query,
+            "matches": [{"id": row.get("id"), "name": row.get("name")} for row in exact[:10]],
+            "message": "The exact query matches multiple records; specify an ID.",
+        }
+
+    partial = [
+        row for row in valid_records
+        if needle in str(row.get("id", "")).casefold()
+        or needle in str(row.get("name", "")).casefold()
+    ]
+    if len(partial) == 1:
+        return {"status": "found", "record": partial[0]}
+    if len(partial) > 1:
+        return {
+            "status": "ambiguous",
+            "query": query,
+            "matches": [{"id": row.get("id"), "name": row.get("name")} for row in partial[:10]],
+            "message": "Several records match; specify the exact name or ID.",
+        }
+    return {"status": "not_found", "query": query}
+
+
+def _make_area_busyness_response(record: dict, entity_type: str, source_path: Path) -> dict:
+    """Format data and explicitly label its proxy nature and freshness."""
+    detail = record.get("area_busyness_detail")
+    if not isinstance(detail, dict):
+        detail = {}
+
+    measured_at = detail.get("measured_at")
+    age_minutes = None
+    freshness = "unknown"
+    if isinstance(measured_at, str) and measured_at.strip():
+        try:
+            parsed = datetime.fromisoformat(measured_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                # Collector timestamps are normally timezone-aware. For old
+                # timestamps without an offset, assume Kolkata local time.
+                parsed = parsed.replace(tzinfo=KOLKATA_TIMEZONE)
+            age_minutes = max(
+                0.0,
+                (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 60,
+            )
+            freshness = "fresh" if age_minutes <= CROWD_DATA_MAX_AGE_MINUTES else "stale"
+        except (TypeError, ValueError, OverflowError):
+            freshness = "unknown"
+
+    label = record.get("area_busyness")
+    if label in (None, "", "Unknown", "Not measured"):
+        data_status = "measurement_unavailable"
+    elif freshness == "stale":
+        data_status = "stale"
+    elif freshness == "fresh":
+        data_status = "success"
+    else:
+        data_status = "freshness_unknown"
+
+    radius_m = detail.get("radius_m")
+    if entity_type == "pandal":
+        limitation = (
+            f"This estimate is derived from TomTom vehicle speeds/congestion on sampled roads "
+            f"within approximately {radius_m if radius_m is not None else 500} m of the pandal. "
+            "It is not a direct count of visitors, pedestrian density, or queue length."
+        )
+    else:
+        limitation = (
+            f"This estimate is derived from TomTom vehicle speeds/congestion on sampled roads "
+            f"within approximately {radius_m if radius_m is not None else 100} m of the station. "
+            "It is not a direct count of passengers, platform crowding, or train occupancy."
+        )
+
+    return {
+        "status": data_status,
+        "entity_type": entity_type,
+        "id": record.get("id"),
+        "name": record.get("name"),
+        "area": record.get("area"),
+        "address": record.get("address"),
+        "area_busyness": label,
+        "measurement_type": "road_traffic_derived_area_busyness_proxy",
+        "area_busyness_detail": detail,
+        "measured_at": measured_at,
+        "data_age_minutes": round(age_minutes, 1) if age_minutes is not None else None,
+        "freshness": freshness,
+        "freshness_threshold_minutes": CROWD_DATA_MAX_AGE_MINUTES,
+        "source": "TomTom Traffic Flow Segment Data API via the project collector",
+        "source_snapshot": source_path.name,
+        "interpretation_and_limitations": limitation,
+        "stale_data_note": (
+            "This snapshot exceeds the configured freshness threshold; treat it as historical context, not current conditions."
+            if freshness == "stale" else None
+        ),
+    }
+
+
+def _compact_area_busyness_context(record: dict | None, entity_type: str, source_path: Path) -> dict:
+    """Compact per-stop context for route responses."""
+    if not isinstance(record, dict):
+        return {
+            "status": "unavailable",
+            "area_busyness": None,
+            "freshness": "unknown",
+            "measurement_type": "road_traffic_derived_area_busyness_proxy",
+            "note": f"No matching enriched record was found in {source_path.name}.",
+        }
+
+    full = _make_area_busyness_response(record, entity_type, source_path)
+    detail = full.get("area_busyness_detail") or {}
+    return {
+        "status": full.get("status"),
+        "area_busyness": full.get("area_busyness"),
+        "measured_at": full.get("measured_at"),
+        "data_age_minutes": full.get("data_age_minutes"),
+        "freshness": full.get("freshness"),
+        "avg_congestion_pct": detail.get("avg_congestion_pct"),
+        "peak_congestion_pct": detail.get("peak_congestion_pct"),
+        "avg_speed_kmph": detail.get("avg_speed_kmph"),
+        "road_segments": detail.get("road_segments"),
+        "radius_m": detail.get("radius_m"),
+        "measurement_type": full.get("measurement_type"),
+        "note": full.get("interpretation_and_limitations"),
+        "stale_data_note": full.get("stale_data_note"),
+    }
+
+
+def _crowd_record_map(path: Path) -> dict | list[dict]:
+    """Load an enriched snapshot into an ID-keyed map for one operation."""
+    records = _read_enriched_snapshot(path)
+    if isinstance(records, dict):
+        return records
+    return {
+        str(row.get("id", "")).strip().casefold(): row
+        for row in records
+        if isinstance(row, dict) and str(row.get("id", "")).strip()
+    }
+
+
+def _crowd_for_id(path: Path, entity_type: str, record_id: str) -> dict:
+    records = _read_enriched_snapshot(path)
+    if isinstance(records, dict):
+        return records
+    match = _lookup_enriched_record(records, record_id)
+    if match.get("status") != "found":
+        return match
+    return _make_area_busyness_response(match["record"], entity_type, path)
+
+
+def _summarize_route_busyness(stops: list[dict]) -> dict:
+    label_counts: dict[str, int] = {}
+    stale_stops = []
+    unavailable_stops = []
+    freshness_unknown_stops = []
+    fresh_count = 0
+
+    for stop in stops:
+        context = stop.get("road_traffic_busyness") or {}
+        status = context.get("status")
+        name = stop.get("pandal_name") or stop.get("name") or stop.get("pandal_id")
+        if status == "success":
+            fresh_count += 1
+            label = str(context.get("area_busyness") or "Unknown")
+            label_counts[label] = label_counts.get(label, 0) + 1
+        elif status == "stale":
+            stale_stops.append(name)
+        elif status == "freshness_unknown":
+            freshness_unknown_stops.append(name)
+        else:
+            unavailable_stops.append(name)
+
+    if fresh_count == len(stops) and stops:
+        summary_status = "success"
+    elif fresh_count or stale_stops or freshness_unknown_stops:
+        summary_status = "partial"
+    else:
+        summary_status = "unavailable"
+
+    return {
+        "status": summary_status,
+        "fresh_estimates_count": fresh_count,
+        "total_stops": len(stops),
+        "fresh_label_counts": label_counts,
+        "stale_stops": stale_stops,
+        "freshness_unknown_stops": freshness_unknown_stops,
+        "unavailable_stops": unavailable_stops,
+        "selection_effect": (
+            "Context only. This estimate is not used to rank route candidates because it measures nearby road traffic, not pedestrian crowd levels."
+        ),
+    }
+
+
+@mcp.tool()
+def get_pandal_crowding(pandal_name_or_id: str) -> dict:
+    """Get the latest road-traffic-derived area-busyness estimate near a Puja pandal.
+
+    MUST be used when the user asks how busy or crowded a named pandal area is.
+    Match by exact pandal ID/name where possible. Return measurement time and
+    freshness. This is a road-traffic proxy, not a direct count of people,
+    visitors, queues, or pedestrian density.
+    """
+    records = _read_enriched_snapshot(CROWD_PANDALS_FILE)
+    if isinstance(records, dict):
+        return records
+    match = _lookup_enriched_record(records, pandal_name_or_id)
+    if match.get("status") != "found":
+        return match
+    return _make_area_busyness_response(match["record"], "pandal", CROWD_PANDALS_FILE)
+
+
+@mcp.tool()
+def get_metro_station_crowding(station_name_or_id: str) -> dict:
+    """Get the latest road-traffic-derived area-busyness estimate near a Metro station.
+
+    MUST be used when the user asks how busy or crowded the area around a
+    named Metro station is. This is not a direct measure of passengers,
+    platform density, or train occupancy.
+    """
+    records = _read_enriched_snapshot(CROWD_STATIONS_FILE)
+    if isinstance(records, dict):
+        return records
+    match = _lookup_enriched_record(records, station_name_or_id)
+    if match.get("status") != "found":
+        return match
+    return _make_area_busyness_response(match["record"], "metro_station", CROWD_STATIONS_FILE)
+
 
 @mcp.resource("puja://2026/pandals")
 def puja_pandals_resource() -> str:
@@ -576,6 +879,12 @@ def get_nearest_metro(latitude: float, longitude: float) -> dict:
 
     result = dict(nearest_station)
     result["distance_km"] = round(nearest_distance, 2)
+    result["distance_type"] = "straight_line_geographic"
+    result["road_traffic_busyness"] = _crowd_for_id(
+        CROWD_STATIONS_FILE,
+        "metro_station",
+        str(nearest_station.get("id", "")),
+    )
 
     return result
 
@@ -636,17 +945,25 @@ def _validate_route_stop_count(pandal_ids: list[str]) -> dict | None:
 
 
 def build_route_stop_snapshot(selected_pandals: list[dict]) -> list[dict]:
-    """Return a compact, deterministic representation of supplied stops."""
-    return [
-        {
+    """Return route stops with current road-traffic-derived busyness context."""
+    crowd_map = _crowd_record_map(CROWD_PANDALS_FILE)
+    snapshot = []
+    for i, pandal in enumerate(selected_pandals):
+        crowd_record = (
+            crowd_map.get(str(pandal.get("id", "")).strip().casefold())
+            if isinstance(crowd_map, dict) else None
+        )
+        snapshot.append({
             "stop_number": i + 1,
             "id": pandal["id"],
             "name": pandal["name"],
             "latitude": pandal["latitude"],
-            "longitude": pandal["longitude"]
-        }
-        for i, pandal in enumerate(selected_pandals)
-    ]
+            "longitude": pandal["longitude"],
+            "road_traffic_busyness": _compact_area_busyness_context(
+                crowd_record, "pandal", CROWD_PANDALS_FILE
+            ),
+        })
+    return snapshot
 
 
 def build_straight_line_fallback_legs(selected_pandals: list[dict]) -> list[dict]:
@@ -2663,11 +2980,11 @@ def fetch_weather_for_locations(
                     )
                     or (
                         isinstance(hour["precipitation_mm"], (int, float))
-                        and hour["precipitation_mm"] >= 0.1
+                        and hour["precipitation_mm"] >= 0.5
                     )
                     or (
                         isinstance(hour["rain_mm"], (int, float))
-                        and hour["rain_mm"] >= 0.1
+                        and hour["rain_mm"] >= 0.5
                     )
                 )
             )
@@ -2684,7 +3001,25 @@ def fetch_weather_for_locations(
                 "latitude": latitude,
                 "longitude": longitude,
                 "forecast_hours": forecast_hours,
+                # This endpoint's values used here do not classify precipitation
+                # type (e.g. drizzle) or intensity. Do not infer either from
+                # probability or accumulation alone.
+                "precipitation_type_available": False,
+                "precipitation_type": None,
+                "precipitation_type_note": (
+                    "Precipitation type/intensity is not available in this "
+                    "result. Do not infer drizzle, showers, or rain intensity "
+                    "from probability or amount alone."
+                ),
+                # Trace-level precipitation is retained in the metrics but does
+                # not trigger a route-level rain signal on its own. A rain signal
+                # requires >=50% hourly probability or >=0.5 mm in an hour.
                 "rain_expected": rain_hour_count > 0,
+                "rain_signal_detected": rain_hour_count > 0,
+                "rain_signal_thresholds": {
+                    "precipitation_probability_percent": 50,
+                    "precipitation_mm_per_hour": 0.5,
+                },
                 "rain_signal_hours": rain_hour_count,
                 "mean_precipitation_probability_percent": (
                     round(sum(probability_values) / len(probability_values), 1)
@@ -2736,15 +3071,27 @@ def fetch_weather_for_locations(
 
 @mcp.tool()
 def recommend_puja_route(
-    latitude: float,
-    longitude: float
+    latitude: float | None = None,
+    longitude: float | None = None
 ) -> dict:
     """
-    Recommend a planned Kolkata Puja route using proximity and weather.
+    Recommend a planned Kolkata Puja route using weather and, when supplied,
+    a known starting coordinate.
+
+    LOCATION RULES
+    - Only pass latitude and longitude when the user explicitly supplied them
+      or a trusted location source returned them in this conversation.
+    - Never guess, infer, or silently substitute the user's current location.
+    - If no reliable starting coordinates are available, call this tool with
+      no arguments. The original planned route order is retained and no
+      distance-to-user or nearest-to-user claim is returned.
+    - If coordinates are supplied, distances are straight-line distances,
+      not walking or driving distances.
 
     Selection logic:
-    - Find planned routes and rotate each route to start at its nearest
-      pandal relative to the user's location.
+    - With valid start coordinates, rotate each route to start at its nearest
+      pandal relative to those coordinates.
+    - Without start coordinates, preserve each route's original planned order.
     - Fetch hourly rain forecasts for pandal stops on candidate routes.
     - When rain is forecast and all candidate forecasts are complete,
       rank routes by rain exposure, precipitation probability, and
@@ -2752,18 +3099,48 @@ def recommend_puja_route(
     - Use planned duration and proximity as tie-breakers.
     - If weather data is unavailable or incomplete, retain the original
       nearest-pandal selection rule.
+    - Include each stop's latest road-traffic-derived busyness estimate and
+      route-level data freshness summary when available. Do not use these
+      estimates to rank routes: they are not direct pedestrian crowd data.
 
-    WEATHER INTERPRETATION
-    - Base route selection explanations only on the returned
-      weather_context, weather_assessment, and selection_reason.
-    - Do not claim weather changed the recommendation unless
-      weather_adjustment_applied is true.
-    - A user's hypothetical assumption that it is raining does
-      not override the actual forecast returned by the weather tool.
-    - If the user requests a hypothetical rainy scenario, explain
-      that the production recommendation uses forecast data.
-    - Never claim a route is sheltered, flood-free, or safer
-      unless reliable data supports that claim.    
+    WEATHER INTERPRETATION AND USER-FACING STYLE
+    - Use the returned forecast measurements and weather_summary as the source
+      of truth. Explain weather in concise, natural language for a tourist.
+    - Keep weather copy to 1-3 short sentences unless the user asks for details.
+      Include the maximum hourly precipitation probability and, when useful, the
+      average forecast precipitation. Avoid unnecessary technical explanation.
+    - Do not expose implementation details such as configured trigger thresholds,
+      internal signal flags, field names, or how the collector decides a signal.
+      Do not say "rain signal met the configured threshold" or list the thresholds
+      unless the user specifically asks how the system works.
+    - If there is no notable forecast indication, say the chance looks very low
+      (below 10%) or low but not zero (10% to below 20%), and give the percentage.
+      For 20% or higher, report the exact percentage without overstating certainty.
+    - Do not say "rain expected" when rain_signal_detected is false. A probability
+      describes a chance, not a guarantee that precipitation will occur.
+    - Do not infer or name precipitation type/intensity (such as drizzle, showers,
+      light rain, or heavy rain) from probability or a small precipitation amount.
+      Only mention type/intensity if an explicit forecast field supports it.
+    - Use weather_assessment.visitor_preparation_guidance as the basis for any
+      advice about preparing for wet weather. Do not replace it with a definitive
+      statement that an umbrella/raincoat is or is not needed.
+    - Keep this advice practical and user-friendly: state the chance plainly,
+      recommend checking the forecast before leaving, and describe a compact
+      umbrella as an optional precaution when the chance is low but non-zero.
+      Do not infer drizzle, showers, rain intensity, or certainty from probability.
+    - For road-traffic busyness, use area_busyness_context.user_facing_summary.
+      Never infer that pandals are uncrowded, that queues are short, or that the
+      visit will be smooth/easy just because nearby road traffic is labelled Light.
+      Light traffic describes sampled roads and is not a pedestrian-crowd measure.
+    - Never claim that a route is sheltered, flood-free, or safer unless reliable
+      data supports that claim. The forecast applies to planned stops, not every
+      road segment, and does not establish road safety.
+    - Never invent a starting point or distance. If no explicit or trusted
+      coordinates were supplied, call without latitude/longitude and do not say a
+      pandal is a certain distance from the user.
+    - Do not claim weather changed the route recommendation unless
+      weather_adjustment_applied is true. Without reliable starting coordinates,
+      preserve the original planned order and make no distance-to-user claim.
 
     OSRM remains responsible for calculating actual driving routes.
     Weather forecasts do not establish flooding, road closures, or
@@ -2771,19 +3148,40 @@ def recommend_puja_route(
     """
 
     # ---------------------------------------------------------
-    # 1. Validate the user's coordinates.
+    # 1. Validate an optional starting location.
     # ---------------------------------------------------------
-    if not (-90 <= latitude <= 90):
+    if (latitude is None) != (longitude is None):
         return {
             "status": "error",
-            "message": "Latitude must be between -90 and 90."
+            "message": (
+                "Provide both latitude and longitude, or omit both when "
+                "no reliable starting coordinates are available."
+            ),
         }
 
-    if not (-180 <= longitude <= 180):
-        return {
-            "status": "error",
-            "message": "Longitude must be between -180 and 180."
-        }
+    has_start_coordinates = latitude is not None and longitude is not None
+
+    if has_start_coordinates:
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (TypeError, ValueError):
+            return {
+                "status": "error",
+                "message": "Latitude and longitude must be numeric values.",
+            }
+
+        if not (math.isfinite(latitude) and -90 <= latitude <= 90):
+            return {
+                "status": "error",
+                "message": "Latitude must be a finite number between -90 and 90.",
+            }
+
+        if not (math.isfinite(longitude) and -180 <= longitude <= 180):
+            return {
+                "status": "error",
+                "message": "Longitude must be a finite number between -180 and 180.",
+            }
 
     # ---------------------------------------------------------
     # 2. Build a fast lookup of the pandal dataset.
@@ -2792,6 +3190,9 @@ def recommend_puja_route(
         str(p["id"]).strip().lower(): p
         for p in pandals
     }
+    # Read the most recent successful crowd snapshot once for this recommendation.
+    crowd_map_result = _crowd_record_map(CROWD_PANDALS_FILE)
+    crowd_by_pandal_id = crowd_map_result if isinstance(crowd_map_result, dict) else {}
 
     route_candidates = []
 
@@ -2815,31 +3216,39 @@ def recommend_puja_route(
         if not valid_route_ids:
             continue
 
-        nearest_index = None
-        nearest_pandal = None
-        nearest_distance = float("inf")
+        nearest_index = 0
+        nearest_pandal = pandal_by_id[
+            str(valid_route_ids[0]).strip().lower()
+        ]
+        nearest_distance = None
 
-        for index, pandal_id in enumerate(valid_route_ids):
-            pandal = pandal_by_id[
-                str(pandal_id).strip().lower()
-            ]
+        if has_start_coordinates:
+            nearest_index = None
+            nearest_pandal = None
+            nearest_distance = float("inf")
 
-            distance = haversine_distance(
-                latitude,
-                longitude,
-                float(pandal["latitude"]),
-                float(pandal["longitude"])
-            )
+            for index, pandal_id in enumerate(valid_route_ids):
+                pandal = pandal_by_id[
+                    str(pandal_id).strip().lower()
+                ]
 
-            if distance < nearest_distance:
-                nearest_distance = distance
-                nearest_pandal = pandal
-                nearest_index = index
+                distance = haversine_distance(
+                    latitude,
+                    longitude,
+                    float(pandal["latitude"]),
+                    float(pandal["longitude"])
+                )
 
-        if nearest_pandal is None or nearest_index is None:
-            continue
+                if distance < nearest_distance:
+                    nearest_distance = distance
+                    nearest_pandal = pandal
+                    nearest_index = index
 
-        # Rotate the original route to start at its nearest pandal.
+            if nearest_pandal is None or nearest_index is None:
+                continue
+
+        # Rotate only when a reliable start coordinate was supplied;
+        # otherwise preserve the original route order.
         recommended_pandal_ids = (
             valid_route_ids[nearest_index:]
             + valid_route_ids[:nearest_index]
@@ -2855,30 +3264,40 @@ def recommend_puja_route(
                 str(pandal_id).strip().lower()
             ]
 
+            crowd_record = crowd_by_pandal_id.get(
+                str(pandal.get("id", "")).strip().casefold()
+            )
             recommended_stops.append({
                 "stop_number": stop_number,
                 "pandal_id": pandal["id"],
                 "pandal_name": pandal["name"],
                 "latitude": float(pandal["latitude"]),
-                "longitude": float(pandal["longitude"])
+                "longitude": float(pandal["longitude"]),
+                "road_traffic_busyness": _compact_area_busyness_context(
+                    crowd_record, "pandal", CROWD_PANDALS_FILE
+                ),
             })
 
         route_candidates.append({
             "route_id": route_id,
             "route_name": route_name,
 
-            "nearest_pandal": {
+            "nearest_pandal": ({
                 "pandal_id": nearest_pandal["id"],
                 "pandal_name": nearest_pandal["name"],
                 "latitude": nearest_pandal["latitude"],
                 "longitude": nearest_pandal["longitude"]
-            },
+            } if has_start_coordinates else None),
 
-            "distance_to_nearest_pandal_km": round(
-                nearest_distance, 2
+            "distance_to_nearest_pandal_km": (
+                round(nearest_distance, 2)
+                if has_start_coordinates else None
             ),
-            "distance_type": "straight_line_geographic",
-            "distance_source": "Haversine",
+            "distance_type": (
+                "straight_line_geographic" if has_start_coordinates else None
+            ),
+            "distance_source": "Haversine" if has_start_coordinates else None,
+            "start_location_provided": has_start_coordinates,
             "route_calculated": False,
 
             "total_stops": len(recommended_stops),
@@ -2889,14 +3308,24 @@ def recommend_puja_route(
 
             "recommended_stops": recommended_stops,
             "recommended_pandal_ids": recommended_pandal_ids,
+            "area_busyness_assessment": _summarize_route_busyness(
+                recommended_stops
+            ),
 
             "source": route.get("source"),
             "source_url": route.get("source_url"),
 
             "route_order_strategy": (
-                "Start at the pandal nearest to the user, then continue "
-                "in the original planned-route order. This is a planned "
-                "sequence, not a shortest-driving-route optimization."
+                (
+                    "Start at the pandal nearest to the supplied starting "
+                    "coordinates, then continue in the original planned-route "
+                    "order. Distance is straight-line, not road or walking distance. "
+                    "This is not a shortest-driving-route optimization."
+                )
+                if has_start_coordinates else
+                "No starting coordinates were supplied. Preserve the original "
+                "planned-route order; no distance-to-user or nearest-to-user "
+                "claim is available. This is not a shortest-driving-route optimization."
             ),
 
             "route_optimization": {
@@ -3028,6 +3457,59 @@ def recommend_puja_route(
             if probabilities else None
         )
 
+        maximum_probabilities = [
+            forecast["max_precipitation_probability_percent"]
+            for forecast in stop_forecasts
+            if isinstance(
+                forecast.get("max_precipitation_probability_percent"),
+                (int, float)
+            )
+        ]
+        maximum_probability = (
+            max(maximum_probabilities)
+            if maximum_probabilities else None
+        )
+
+        rain_signal_detected = rainy_stops > 0
+        if rain_signal_detected:
+            if maximum_probability is not None:
+                weather_summary = (
+                    f"The forecast indicates a possibility of precipitation at "
+                    f"some stops during the next eight hours. The highest hourly "
+                    f"chance is {maximum_probability}%. Check the forecast again "
+                    "before setting out; it does not specify precipitation type or "
+                    "guarantee road conditions."
+                )
+            else:
+                weather_summary = (
+                    "The forecast indicates a possibility of precipitation at "
+                    "some stops during the next eight hours. Check the latest "
+                    "forecast before setting out."
+                )
+        elif maximum_probability is not None and maximum_probability < 10:
+            weather_summary = (
+                f"The chance of precipitation looks very low, with a maximum "
+                f"hourly probability of {maximum_probability}%. Forecasts can "
+                "change, so check again before leaving."
+            )
+        elif maximum_probability is not None and maximum_probability < 20:
+            weather_summary = (
+                f"The chance of precipitation is low but not zero. The maximum "
+                f"hourly probability is {maximum_probability}%. Check again "
+                "before leaving, as conditions can change."
+            )
+        elif maximum_probability is not None:
+            weather_summary = (
+                f"The highest hourly chance of precipitation is "
+                f"{maximum_probability}%. This is a possibility, not a guarantee "
+                "that it will rain. Check the latest forecast before leaving."
+            )
+        else:
+            weather_summary = (
+                "A reliable precipitation probability is not available for this "
+                "forecast window. Check a current forecast before heading out."
+            )
+
         mean_precipitation = round(
             sum(
                 float(
@@ -3038,26 +3520,67 @@ def recommend_puja_route(
             2
         )
 
+        # Keep the user-facing preparation advice explicit in the tool result,
+        # so the model does not improvise a definitive "no umbrella needed" claim.
+        if rain_signal_detected:
+            visitor_preparation_guidance = (
+                "The forecast indicates a possibility of precipitation at some stops. "
+                "Check the latest forecast before leaving; consider carrying an umbrella. "
+                "The available values do not identify precipitation type or intensity."
+            )
+        elif maximum_probability is None:
+            visitor_preparation_guidance = (
+                "A reliable precipitation probability is unavailable for this route. "
+                "Check a current forecast before leaving; the available data is not "
+                "enough to make a confident recommendation about rain gear."
+            )
+        elif maximum_probability < 10:
+            visitor_preparation_guidance = (
+                f"The chance of precipitation is very low, with a maximum hourly "
+                f"probability of {maximum_probability}%. Check again before leaving. "
+                "Carrying a compact umbrella is an optional precaution if you prefer."
+            )
+        elif maximum_probability < 20:
+            visitor_preparation_guidance = (
+                f"The chance of precipitation is low but not zero, with a maximum "
+                f"hourly probability of {maximum_probability}%. Check the forecast "
+                "before leaving; if you will be out for several hours, carrying a "
+                "compact umbrella is an optional precaution."
+            )
+        elif maximum_probability < 50:
+            visitor_preparation_guidance = (
+                f"There is a chance of precipitation, with a maximum hourly "
+                f"probability of {maximum_probability}%. Check the forecast before "
+                "leaving and consider bringing an umbrella."
+            )
+        else:
+            visitor_preparation_guidance = (
+                f"The forecast shows a higher chance of precipitation, with a maximum "
+                f"hourly probability of {maximum_probability}%. Check the latest "
+                "forecast and consider bringing an umbrella."
+            )
+
+        candidate["_weather_selection_metrics"] = {
+            "rain_signal_stops": rainy_stops,
+            "rain_signal_stop_fraction": round(rainy_stops / len(stops), 3),
+            "rain_signal_detected": rain_signal_detected,
+        }
         candidate["weather_assessment"] = {
             "status": "success",
             "source": "Open-Meteo",
             "forecast_hours": 8,
             "total_pandal_stops": len(stops),
-            "rain_signal_stops": rainy_stops,
-            "rain_signal_stop_fraction": round(
-                rainy_stops / len(stops),
-                3
-            ),
-            "mean_precipitation_probability_percent": (
-                mean_probability
-            ),
-            "mean_precipitation_mm_per_stop": (
-                mean_precipitation
-            ),
+            # These metrics help Claude give a concise, grounded forecast summary.
+            # Route-selection flags and trigger thresholds are intentionally not
+            # returned as user-facing output.
+            "mean_precipitation_probability_percent": mean_probability,
+            "max_hourly_precipitation_probability_percent": maximum_probability,
+            "mean_precipitation_mm_per_stop": mean_precipitation,
+            "weather_summary": weather_summary,
+            "visitor_preparation_guidance": visitor_preparation_guidance,
             "assessment_basis": (
-                "Forecast rainfall at pandal coordinates during "
-                "the next eight hours. Weather between stops is "
-                "not assessed."
+                "Forecast values are for planned pandal stops during the next "
+                "eight hours; weather between stops is not assessed."
             )
         }
 
@@ -3072,7 +3595,7 @@ def recommend_puja_route(
     rain_expected = (
         weather_complete
         and any(
-            candidate["weather_assessment"]["rain_signal_stops"] > 0
+            candidate.get("_weather_selection_metrics", {}).get("rain_signal_stops", 0) > 0
             for candidate in route_candidates
         )
     )
@@ -3108,49 +3631,95 @@ def recommend_puja_route(
                 else float("inf")
             )
 
+            selection_metrics = route.get("_weather_selection_metrics", {})
             return (
-                assessment["rain_signal_stop_fraction"],
+                selection_metrics.get("rain_signal_stop_fraction", 1.0),
                 probability_key,
                 assessment["mean_precipitation_mm_per_stop"],
                 planned_duration_key(route),
-                route["distance_to_nearest_pandal_km"]
+                (
+                    route["distance_to_nearest_pandal_km"]
+                    if isinstance(route.get("distance_to_nearest_pandal_km"), (int, float))
+                    else float("inf")
+                )
             )
 
         route_candidates.sort(key=weather_route_key)
         weather_adjustment_applied = True
 
         selection_reason = (
-            "Rain is forecast at one or more candidate pandal stops. "
-            "Routes were ranked by the proportion of stops with a rain "
-            "signal, mean precipitation probability, and mean forecast "
-            "precipitation per stop. Planned itinerary duration and "
-            "proximity break ties. This does not establish that a route "
-            "is sheltered, flood-free, or safer."
+            "The route order was chosen after comparing the available "
+            "precipitation forecasts at planned stops. This does not mean "
+            "the route is sheltered or that road conditions are guaranteed."
         )
 
     else:
         # Preserve existing behaviour if forecasts are unavailable,
         # incomplete, or show no configured rain signal.
-        route_candidates.sort(
-            key=lambda route: (
-                route["distance_to_nearest_pandal_km"]
+        if has_start_coordinates:
+            route_candidates.sort(
+                key=lambda route: route["distance_to_nearest_pandal_km"]
             )
-        )
 
         if weather_complete:
-            selection_reason = (
-                "No configured rain signal was detected at the candidate "
-                "pandal stops in the forecast window. The original "
-                "nearest-pandal selection rule was retained."
-            )
-        else:
+            if has_start_coordinates:
+                selection_reason = (
+                    "The available forecast did not indicate a notable "
+                    "precipitation concern at the planned stops, so the "
+                    "location-based route choice was retained."
+                )
+            else:
+                selection_reason = (
+                    "The available forecast did not indicate a notable "
+                    "precipitation concern at the planned stops, so the original "
+                    "planned route order was retained. No starting location was "
+                    "provided, so distances from you are not shown."
+                )
+        elif has_start_coordinates:
             selection_reason = (
                 "Weather data was unavailable or incomplete for one or "
                 "more candidate routes. The original nearest-pandal "
                 "selection rule was retained without weather adjustment."
             )
+        else:
+            selection_reason = (
+                "Weather data was unavailable or incomplete for one or "
+                "more candidate routes. With no reliable starting coordinates, "
+                "the original planned-route order was retained; no distance-to-user "
+                "claim is made."
+            )
 
     recommended = route_candidates[0]
+
+    # Remove internal route-ranking flags before returning results to the LLM.
+    # Return only concise, user-facing weather fields for each route option.
+    def make_user_facing_route(route: dict) -> dict:
+        public_route = dict(route)
+        public_route.pop("_weather_selection_metrics", None)
+        assessment = public_route.get("weather_assessment")
+        if isinstance(assessment, dict):
+            allowed_weather_fields = {
+                "status",
+                "source",
+                "forecast_hours",
+                "total_pandal_stops",
+                "mean_precipitation_probability_percent",
+                "max_hourly_precipitation_probability_percent",
+                "mean_precipitation_mm_per_stop",
+                "weather_summary",
+                "visitor_preparation_guidance",
+                "assessment_basis",
+            }
+            public_route["weather_assessment"] = {
+                key: value for key, value in assessment.items()
+                if key in allowed_weather_fields
+            }
+        return public_route
+
+    public_recommended = make_user_facing_route(recommended)
+    public_alternatives = [
+        make_user_facing_route(route) for route in route_candidates[1:]
+    ]
 
     # ---------------------------------------------------------
     # 7. Return the recommendation, evidence, and limitations.
@@ -3158,13 +3727,22 @@ def recommend_puja_route(
     return {
         "status": "success",
 
-        "user_location": {
-            "latitude": latitude,
-            "longitude": longitude
-        },
+        "user_location": (
+            {
+                "latitude": latitude,
+                "longitude": longitude,
+                "coordinate_source": "coordinates_supplied_to_tool",
+            }
+            if has_start_coordinates else None
+        ),
+        "start_location_status": (
+            "coordinates_supplied"
+            if has_start_coordinates else "not_provided"
+        ),
+        "distance_to_user_available": has_start_coordinates,
 
-        "recommended_route": recommended,
-        "other_route_options": route_candidates[1:],
+        "recommended_route": public_recommended,
+        "other_route_options": public_alternatives,
 
         "weather_context": {
             "status": weather_context.get("status", "unavailable"),
@@ -3176,18 +3754,34 @@ def recommend_puja_route(
             "forecast_window_end_local": weather_context.get(
                 "forecast_window_end_local"
             ),
-            "weather_adjustment_applied": (
-                weather_adjustment_applied
-            ),
+            "weather_adjustment_applied": weather_adjustment_applied,
+            "recommended_route_weather_summary": public_recommended.get(
+                "weather_assessment", {}
+            ).get("weather_summary"),
             "limitations": (
-                "Weather is assessed at planned pandal stops, not along "
-                "every road segment. OSRM distances and durations are "
-                "not weather-adjusted. Rain forecasts do not establish "
-                "flooding, road closures, shelter availability, or safety."
+                "Forecasts apply to planned pandal stops, not every road segment. "
+                "They do not specify precipitation type unless explicitly provided, "
+                "and they do not establish flooding, road closures, shelter, or safety."
             )
         },
 
         "selection_reason": selection_reason,
+
+        "area_busyness_context": {
+            "included": True,
+            "source": "TomTom Traffic Flow Segment Data API via the project collector",
+            "interpretation": (
+                "Road-traffic-derived proxy at sampled roads near pandals; it is not direct pedestrian crowd, queue, or visitor-count data."
+            ),
+            "user_facing_summary": (
+                "The road-traffic readings can describe vehicle congestion on sampled roads near the pandals. "
+                "They do not show how crowded the pandals or queues are and cannot guarantee a smooth visit."
+            ),
+            "selection_effect": (
+                "Used as informational context only; route ranking remains based on the existing weather and proximity logic."
+            ),
+            "freshness_threshold_minutes": CROWD_DATA_MAX_AGE_MINUTES,
+        },
 
         "usage_note": (
             "Use plan_puja_route() with recommended_pandal_ids to "
@@ -3523,6 +4117,1370 @@ def get_puja_schedule(
             )
         ),
     }
+
+@mcp.resource("metro://2026/puja-special-services")
+def metro_puja_special_services_resource() -> str:
+    """Expose the official, date-specific Metro Puja special-services notice."""
+    return json.dumps(
+        metro_puja_special_services_data,
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+def _metro_period_user_summary(line_name: str, event_date: str, period: dict) -> str:
+    """Create a concise, tourist-friendly summary for one line/date period."""
+    try:
+        date_label = datetime.strptime(event_date, "%Y-%m-%d").strftime("%d %b %Y")
+    except (TypeError, ValueError):
+        date_label = event_date
+
+    if period.get("service_status") == "suspended":
+        return (
+            f"{line_name}: no services are scheduled for {date_label} under "
+            "the supplied Metro Railway special-services notice."
+        )
+
+    if period.get("service_status") != "scheduled":
+        return f"{line_name}: service status is not specified for {date_label}."
+
+    start = period.get("service_window_start") or "time unavailable"
+    end = period.get("service_window_end") or "time unavailable"
+    end_offset = period.get("service_window_end_day_offset", 0)
+    end_phrase = f"{end} the following morning" if end_offset == 1 else str(end)
+    parts = [
+        f"{line_name} special services on {date_label} are scheduled from "
+        f"{start} to {end_phrase} IST"
+    ]
+
+    count = period.get("daily_services_total")
+    if count is not None:
+        parts.append(f"{count} services are scheduled that day")
+
+    frequency = period.get("peak_frequency_minutes")
+    if frequency is not None:
+        parts.append(f"peak-hour intervals are about {frequency} minutes")
+
+    return "; ".join(parts) + "."
+
+
+def _metro_overnight_user_summary(
+    line_name: str, service_start_date: str, requested_date: str, period: dict
+) -> str:
+    """Explain prior-date service that continues into the requested date."""
+    try:
+        start_label = datetime.strptime(service_start_date, "%Y-%m-%d").strftime("%d %b %Y")
+    except (TypeError, ValueError):
+        start_label = service_start_date
+    try:
+        requested_label = datetime.strptime(requested_date, "%Y-%m-%d").strftime("%d %b %Y")
+    except (TypeError, ValueError):
+        requested_label = requested_date
+
+    return (
+        f"{line_name}: overnight service that began at "
+        f"{period.get('service_window_start')} IST on {start_label} continues "
+        f"until {period.get('service_window_end')} IST on {requested_label}."
+    )
+
+
+def _metro_last_services_user_summary(line_name: str, service_date: str, period: dict) -> str | None:
+    """Format each published last departure separately without merging routes."""
+    last_services = period.get("last_services")
+    if not isinstance(last_services, list) or not last_services:
+        return None
+
+    try:
+        start_date = datetime.strptime(service_date, "%Y-%m-%d").date()
+        if period.get("service_window_end_day_offset", 0) == 1:
+            last_service_date = (start_date + timedelta(days=1)).strftime("%d %b %Y")
+        else:
+            last_service_date = start_date.strftime("%d %b %Y")
+    except (TypeError, ValueError):
+        last_service_date = service_date
+
+    departures = []
+    for item in last_services:
+        if not isinstance(item, dict):
+            continue
+        time_text = str(item.get("time", "")).strip()
+        origin = str(item.get("from", "")).strip()
+        destination = str(item.get("to", "")).strip()
+        if time_text and origin and destination:
+            departures.append(
+                f"{time_text} IST {last_service_date}: {origin} to {destination}"
+            )
+
+    if not departures:
+        return None
+
+    return (
+        f"Last listed {line_name} departures (each is a separate origin/destination trip): "
+        + "; ".join(departures)
+        + "."
+    )
+
+
+def _metro_user_facing_table_row(line_name: str, period: dict) -> dict:
+    """Return an explicit, UI-ready status row for line/date summaries."""
+    status = str(period.get("service_status", "unknown")).casefold()
+    if status == "suspended":
+        return {
+            "line": line_name,
+            "status": "Suspended",
+            "operating_hours": "—",
+            "services_per_day": "—",
+            "peak_hour_frequency": "—",
+        }
+
+    start = period.get("service_window_start")
+    end = period.get("service_window_end")
+    end_offset = period.get("service_window_end_day_offset", 0)
+    if start and end:
+        operating_hours = f"{start}–{end}"
+        if end_offset == 1:
+            operating_hours += " (next morning)"
+    else:
+        operating_hours = "Not specified"
+
+    count = period.get("daily_services_total")
+    frequency = period.get("peak_frequency_minutes")
+    return {
+        "line": line_name,
+        "status": "Operating" if status == "scheduled" else "Not specified",
+        "operating_hours": operating_hours,
+        "services_per_day": count if count is not None else "—",
+        "peak_hour_frequency": (
+            f"About {frequency} minutes" if frequency is not None else "—"
+        ),
+    }
+
+
+@mcp.tool()
+def get_metro_puja_special_services(
+    event_date: str,
+    line_name: str = "",
+) -> dict:
+    """Look up Kolkata Metro's published Durga Puja 2026 special services by date.
+
+    MUST be used for questions about Metro service timings, first/last services,
+    frequency, number of services, or line suspensions for 15–21 October 2026.
+
+    Required event_date format: YYYY-MM-DD. Optionally set line_name to Blue,
+    Green, Yellow, Purple, or Orange (with or without the word "Line").
+
+    This dataset reproduces the official press-release text supplied to the
+    project, dated 8 October 2026. It is a special-service notice only, not a
+    complete regular timetable. Do not infer schedules outside its coverage.
+    If a later official amendment is available, it must take precedence.
+
+    For Blue and Green Line services that run past midnight, the result may
+    include a continuation from the previous service date. Treat the service
+    start date and next-day end time explicitly; do not mistake the ending time
+    as a new day's first service.
+
+    This tool reports published service information; it does not calculate a
+    station-to-station journey or guarantee live operational status.
+
+    For Yellow and Purple Lines, never describe the schedule as
+    "evening-only". Services begin in the afternoon and continue
+    into the evening. Use this wording:
+    "The Yellow and Purple Lines operate from the afternoon
+    into the evening."
+
+    USER-FACING RESPONSE GUIDANCE:
+    - Use plain language and Kolkata local time (IST). Do not dump raw JSON.
+    - If a line is specified, say first whether it is scheduled or suspended,
+      then provide the operating window and relevant first/last services.
+    - If all lines are requested, use a compact table with exactly these
+      column labels: "Line", "Status", "Operating Hours", "Services per Day",
+      and "Peak-hour Frequency". The Status column must explicitly say
+      "Operating" or "Suspended" based on service_status.
+    - Use daily_services_total for the daily count and peak_frequency_minutes
+      for peak-hour frequency. Do not imply the peak interval applies throughout
+      the day.
+    - For a suspended line, show "Suspended" in the Status column and an em dash
+      for Operating Hours, Services per Day, and Peak-hour Frequency. Do not put
+      the word "Suspended" in the frequency column.
+    - For overnight services, explicitly say that the end time is the next
+      morning and state the calendar date it ends on.
+    - For Blue Line overnight schedules, use the individual last_services records
+      as separate departures with their exact time, origin, and destination. Do
+      not summarise all Blue Line services as one final 04:00 service. If the
+      notice lists 04:00 departures, explain that these listed trips terminate at
+      Dum Dum and Mahanayak Uttam Kumar respectively; do not imply that either is
+      a full end-to-end trip.
+    - Do not describe Yellow or Purple Line schedules as "evening service only".
+      When the schedule starts in the afternoon, say that services begin in the
+      afternoon and continue into the evening, using the actual operating times.
+    - Label service counts as counts scheduled that day, not trains per hour.
+    - Say this is the supplied special-service notice, not live running status,
+      and recommend checking for later official amendments before travel.
+    - Do not infer regular timetables outside the notice's coverage dates.
+    """
+    raw_date = str(event_date or "").strip()
+    try:
+        requested_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return {
+            "status": "error",
+            "error": "event_date is required in YYYY-MM-DD format, for example 2026-10-18.",
+        }
+
+    coverage = metro_puja_special_services_data.get("coverage", {})
+    coverage_start_text = str(coverage.get("start_date", ""))
+    coverage_end_text = str(coverage.get("end_date", ""))
+    try:
+        coverage_start = datetime.strptime(coverage_start_text, "%Y-%m-%d").date()
+        coverage_end = datetime.strptime(coverage_end_text, "%Y-%m-%d").date()
+    except ValueError:
+        return {
+            "status": "unavailable",
+            "error": "The Metro special-services dataset has invalid coverage dates.",
+        }
+
+    source = metro_puja_special_services_data.get("source", {})
+    base_response = {
+        "dataset": metro_puja_special_services_data.get("dataset_name"),
+        "requested_date": raw_date,
+        "timezone": metro_puja_special_services_data.get("timezone", "Asia/Kolkata"),
+        "line_filter": line_name or None,
+        "coverage": coverage,
+        "source": source,
+    }
+
+    if requested_date < coverage_start or requested_date > coverage_end:
+        return {
+            **base_response,
+            "status": "outside_coverage",
+            "result_count": 0,
+            "results": [],
+            "message": (
+                f"This special-services notice covers {coverage_start_text} through "
+                f"{coverage_end_text} only. No Metro timetable for {raw_date} is "
+                "provided by this dataset; do not infer regular service hours."
+            ),
+        }
+
+    all_lines = [
+        item for item in metro_puja_special_services_data.get("lines", [])
+        if isinstance(item, dict) and isinstance(item.get("line_name"), str)
+    ]
+
+    if line_name and line_name.strip():
+        query = re.sub(r"\s+line$", "", line_name.strip().casefold()).strip()
+        exact = [
+            item for item in all_lines
+            if re.sub(r"\s+line$", "", item["line_name"].strip().casefold()).strip() == query
+        ]
+        if not exact:
+            partial = [
+                item for item in all_lines
+                if query in item["line_name"].strip().casefold()
+            ]
+            exact = partial if len(partial) == 1 else []
+        if not exact:
+            return {
+                **base_response,
+                "status": "line_not_found",
+                "available_lines": [item["line_name"] for item in all_lines],
+                "result_count": 0,
+                "results": [],
+                "message": "Specify one of the available Metro line names.",
+            }
+        selected_lines = exact
+    else:
+        selected_lines = all_lines
+
+    requested_text = requested_date.isoformat()
+    previous_text = (requested_date - timedelta(days=1)).isoformat()
+    results = []
+    overnight_continuations = []
+
+    for line in selected_lines:
+        for period in line.get("date_periods", []):
+            if not isinstance(period, dict):
+                continue
+            service_dates = period.get("dates", [])
+            if not isinstance(service_dates, list):
+                continue
+
+            if requested_text in service_dates:
+                results.append({
+                    "line_name": line["line_name"],
+                    "schedule_relation": "service_scheduled_for_requested_date",
+                    "service_date": requested_text,
+                    "user_facing_summary": _metro_period_user_summary(
+                        line["line_name"], requested_text, period
+                    ),
+                    "user_facing_table_row": _metro_user_facing_table_row(
+                        line["line_name"], period
+                    ),
+                    "last_services_summary": _metro_last_services_user_summary(
+                        line["line_name"], requested_text, period
+                    ),
+                    "service_period": period,
+                })
+
+            # Include late-night service from the prior date when it runs into
+            # the calendar day the user asked about.
+            if (
+                previous_text in service_dates
+                and period.get("service_status") == "scheduled"
+                and period.get("service_window_end_day_offset") == 1
+            ):
+                overnight_continuations.append({
+                    "line_name": line["line_name"],
+                    "schedule_relation": "overnight_service_continuing_from_previous_date",
+                    "service_start_date": previous_text,
+                    "user_facing_summary": _metro_overnight_user_summary(
+                        line["line_name"], previous_text, requested_text, period
+                    ),
+                    "service_period": period,
+                    "note": (
+                        f"This service period starts on {previous_text} and continues "
+                        f"into {requested_text}; confirm the listed last-service times "
+                        "before travelling."
+                    ),
+                })
+
+    return {
+        **base_response,
+        "status": "success" if results or overnight_continuations else "no_schedule_found",
+        "result_count": len(results),
+        "results": results,
+        "user_facing_table_rows": [
+            item["user_facing_table_row"]
+            for item in results
+            if isinstance(item.get("user_facing_table_row"), dict)
+        ],
+        "overnight_continuations_from_previous_date": overnight_continuations,
+        "result_count_including_overnight_continuations": len(results) + len(overnight_continuations),
+        "message": (
+            "Published special-service information found. Check for later official amendments before travelling."
+            if results or overnight_continuations
+            else "No schedule entry was found for this date in the supplied special-services notice. Do not guess service times."
+        ),
+        "limitations": [
+            "This is a date-specific special-service notice, not a full regular timetable.",
+            "This lookup provides service information only; use the Metro journey-planning tool for station sequences and line changes. It does not provide live disruption status.",
+            "Service details reproduce the press-release text supplied to the project; check for later official amendments.",
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Date-aware Metro-only journey planning
+# ---------------------------------------------------------------------------
+def _metro_normalize_name(value: str) -> str:
+    """Normalize a station/line label for forgiving name matching."""
+    value = str(value or "").casefold().strip()
+    value = re.sub(r"\bmetro\b", " ", value)
+    value = re.sub(r"\bstation\b", " ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
+
+
+def _load_metro_network_for_route_planner() -> dict:
+    """Load the station graph at query time so replacing the JSON needs no code edit."""
+    try:
+        with METRO_NETWORK_FILE.open("r", encoding="utf-8") as stream:
+            network = json.load(stream)
+    except FileNotFoundError:
+        return {
+            "_error": (
+                "Metro network data is missing. Save the reviewed network as "
+                "data/static/metro_network_2026.json before using Metro journey planning."
+            )
+        }
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"_error": f"Could not read metro_network_2026.json: {exc}"}
+
+    if not isinstance(network, dict):
+        return {"_error": "Metro network data must be a JSON object."}
+    for required in ("lines", "stations", "connections"):
+        if not isinstance(network.get(required), list):
+            return {"_error": f"Metro network data must contain a '{required}' list."}
+    return network
+
+
+def _metro_line_name_map(network: dict) -> dict[str, str]:
+    return {
+        str(item.get("line_id", "")).strip().upper(): str(item.get("line_name", "")).strip()
+        for item in network.get("lines", [])
+        if isinstance(item, dict) and item.get("line_id") and item.get("line_name")
+    }
+
+
+def _metro_schedule_state_for_date(line_name: str, event_date: str, network: dict) -> dict:
+    """Return date-specific schedule state; unknown dates are never guessed."""
+    wanted = _metro_normalize_name(line_name)
+    schedule_lines = metro_puja_special_services_data.get("lines", [])
+    matched_line = next(
+        (
+            row for row in schedule_lines
+            if isinstance(row, dict)
+            and _metro_normalize_name(row.get("line_name", "")) == wanted
+        ),
+        None,
+    )
+    if matched_line:
+        for period in matched_line.get("date_periods", []):
+            if isinstance(period, dict) and event_date in period.get("dates", []):
+                return {
+                    "status": str(period.get("service_status", "unknown")).casefold(),
+                    "period": period,
+                    "source": "metro_puja_special_services_2026.json",
+                }
+
+    # Also honor date-ranged network advisories when no published schedule entry
+    # exists for the requested date. A later explicit scheduled entry above takes
+    # precedence over older advisory metadata.
+    line_id = next(
+        (
+            str(item.get("line_id", "")).upper()
+            for item in network.get("lines", [])
+            if isinstance(item, dict)
+            and _metro_normalize_name(item.get("line_name", "")) == wanted
+        ),
+        "",
+    )
+    for advisory in network.get("temporary_service_advisories", []):
+        if not isinstance(advisory, dict):
+            continue
+        if str(advisory.get("line_id", "")).upper() != line_id:
+            continue
+        if advisory.get("type") == "date_range_line_suspension":
+            start = str(advisory.get("start_date", ""))
+            end = str(advisory.get("end_date", ""))
+            if start and end and start <= event_date <= end:
+                return {
+                    "status": "suspended",
+                    "period": None,
+                    "source": "metro_network_2026.json advisory",
+                    "advisory": advisory,
+                }
+
+    coverage = metro_puja_special_services_data.get("coverage", {})
+    start = str(coverage.get("start_date", ""))
+    end = str(coverage.get("end_date", ""))
+    if start and end and start <= event_date <= end:
+        return {
+            "status": "unknown",
+            "period": None,
+            "source": "no matching date period",
+        }
+    return {
+        "status": "unknown",
+        "period": None,
+        "source": "outside special-services notice coverage",
+    }
+
+
+def _metro_resolve_station(query: str, stations: list[dict]) -> dict:
+    """Resolve station by ID or name; return candidates for ambiguous queries."""
+    needle = _metro_normalize_name(query)
+    if not needle:
+        return {"status": "invalid", "message": "Please provide a station name or ID."}
+
+    aliases = {
+        "m052": {"jai hind bimanbandar", "jai hind airport", "biman bandar", "bimanbandar"},
+        "m016": {"dharmatala", "esplanade metro"},
+        "m008": {"dum dum metro"},
+    }
+    exact = []
+    for station in stations:
+        sid = str(station.get("id", "")).strip()
+        name = _metro_normalize_name(station.get("name", ""))
+        if needle == sid.casefold() or needle == name or needle in aliases.get(sid.casefold(), set()):
+            exact.append(station)
+
+    if len(exact) == 1:
+        return {"status": "found", "station": exact[0]}
+    if len(exact) > 1:
+        return {
+            "status": "ambiguous",
+            "message": "That station name matches multiple records. Please specify the station ID.",
+            "candidates": [{"id": s.get("id"), "name": s.get("name")} for s in exact[:10]],
+        }
+
+    partial = []
+    for station in stations:
+        sid = str(station.get("id", "")).strip().casefold()
+        name = _metro_normalize_name(station.get("name", ""))
+        if needle in name or (sid and needle in sid):
+            partial.append(station)
+    if len(partial) == 1:
+        return {"status": "found", "station": partial[0]}
+    if partial:
+        return {
+            "status": "ambiguous",
+            "message": "Several Metro stations match. Please select one of these names.",
+            "candidates": [{"id": s.get("id"), "name": s.get("name")} for s in partial[:10]],
+        }
+    return {"status": "not_found"}
+
+
+def _metro_resolve_endpoint(query: str, network_stations: list[dict], usable_station_ids: set[str]) -> dict:
+    """Accept a Metro station or a pandal; pandals connect by nearest Metro station."""
+    station_result = _metro_resolve_station(query, network_stations)
+    if station_result.get("status") in {"found", "ambiguous", "invalid"}:
+        if station_result.get("status") == "found":
+            station = station_result["station"]
+            return {
+                "status": "found",
+                "type": "metro_station",
+                "station": station,
+                "station_id": str(station.get("id", "")),
+                "name": station.get("name"),
+            }
+        return station_result
+
+    needle = _metro_normalize_name(query)
+    exact_pandals = [
+        p for p in pandals
+        if _metro_normalize_name(p.get("name", "")) == needle
+        or str(p.get("id", "")).strip().casefold() == str(query).strip().casefold()
+    ]
+    if len(exact_pandals) == 1:
+        pandal = exact_pandals[0]
+    elif len(exact_pandals) > 1:
+        return {
+            "status": "ambiguous",
+            "message": "That pandal name matches multiple records; please specify the pandal ID.",
+            "candidates": [{"id": p.get("id"), "name": p.get("name")} for p in exact_pandals[:10]],
+        }
+    else:
+        partial_pandals = [
+            p for p in pandals
+            if needle and (
+                needle in _metro_normalize_name(p.get("name", ""))
+                or needle in _metro_normalize_name(p.get("area", ""))
+            )
+        ]
+        if len(partial_pandals) == 1:
+            pandal = partial_pandals[0]
+        elif partial_pandals:
+            return {
+                "status": "ambiguous",
+                "message": "Several pandals match. Please specify a more exact name or pandal ID.",
+                "candidates": [{"id": p.get("id"), "name": p.get("name"), "area": p.get("area")} for p in partial_pandals[:10]],
+            }
+        else:
+            return {
+                "status": "not_found",
+                "message": f"Could not find a Metro station or pandal matching '{query}'.",
+                "suggestion": "Use a station name from metro_stations.json or a pandal name from pandals_2026.json.",
+            }
+
+    try:
+        lat = float(pandal["latitude"])
+        lon = float(pandal["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return {"status": "error", "message": f"Pandal '{pandal.get('name')}' has no valid coordinates."}
+
+    candidates = []
+    for station in network_stations:
+        sid = str(station.get("id", ""))
+        if sid not in usable_station_ids:
+            continue
+        try:
+            slat, slon = float(station["latitude"]), float(station["longitude"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        distance = haversine_distance(lat, lon, slat, slon)
+        candidates.append((distance, station))
+    candidates.sort(key=lambda pair: pair[0])
+    if not candidates:
+        return {"status": "unavailable", "message": "No Metro stations are available in the route graph for this date."}
+    distance, station = candidates[0]
+    return {
+        "status": "found",
+        "type": "pandal",
+        "pandal_id": pandal.get("id"),
+        "name": pandal.get("name"),
+        "station": station,
+        "station_id": str(station.get("id", "")),
+        "nearest_metro_station": station.get("name"),
+        "access_distance_km_straight_line": round(distance, 2),
+        "access_distance_note": "Straight-line geographic distance only; this is not a walking route or walking distance.",
+    }
+
+
+def _metro_user_facing_service_note(line_service: dict, travel_date: str) -> str:
+    """Format a short line-service note without implying live running status."""
+    line_name = str(line_service.get("line_name") or "Metro line")
+    status = str(line_service.get("service_status_on_date") or "unknown")
+    if status == "scheduled":
+        start = line_service.get("service_window_start")
+        end = line_service.get("service_window_end")
+        end_offset = line_service.get("service_window_end_day_offset", 0)
+        if start and end:
+            window = f"{start}–{end}" + (" the following morning" if end_offset == 1 else "")
+        else:
+            window = "not specified"
+        frequency = line_service.get("peak_frequency_minutes")
+        frequency_text = (
+            f" Peak-hour intervals are about {frequency} minutes."
+            if frequency is not None else ""
+        )
+        return (
+            f"{line_name}: the supplied special-service notice lists {window} for "
+            f"{travel_date} in Kolkata time." + frequency_text +
+            " This is the published schedule, not live train status."
+        )
+    return (
+        f"{line_name}: the supplied special-service notice does not confirm operating "
+        f"hours for {travel_date}. Check Metro Railway's latest notice before travelling."
+    )
+
+
+@mcp.tool()
+def plan_metro_journey(
+    origin: str,
+    destination: str,
+    travel_date: str = "",
+) -> dict:
+    """Plan a Metro-only station route for a Kolkata journey on a specified date.
+
+    MUST be used when the user asks for a Metro route between stations, asks
+    whether a Metro journey is possible on a date, or asks how to use Metro to
+    reach a pandal. Origin and destination may be Metro station names/IDs or
+    pandal names/IDs. Pandal endpoints are connected to their nearest station
+    by straight-line geographic proximity only; the tool does not calculate
+    the pedestrian access route.
+
+    travel_date is YYYY-MM-DD. If omitted, use today's date in Kolkata time and
+    report that the date was defaulted. During 15–21 October 2026, filter lines
+    using the project's published special-service notice. Never include a line
+    marked suspended on the requested date. For other dates, use the static
+    network only and warn that no timetable for that date is supplied.
+
+    The result is a station-to-station network path with line changes. It is
+    NOT a live train tracker, exact departure itinerary, fare calculator, or
+    travel-time estimate. Do not invent journey duration, fares, live status,
+    walking distance, or service outside the provided sources.
+
+    Prefer fewer line changes, then fewer station-to-station segments. If no
+    path is available because a needed line is suspended, say so clearly rather
+    than suggesting the suspended line.
+
+    USER-FACING RESPONSE GUIDANCE:
+    - Lead with a one-sentence answer saying whether a Metro-only route is available.
+    - If available, present the route as short numbered steps using user_facing_steps.
+      Clearly name the line, boarding station, alighting station, and each interchange.
+    - Show the requested travel date. If omitted, say that today's Kolkata date was assumed.
+    - Do not dump the raw JSON, station IDs, graph states, or internal optimization details.
+    - Do not call the route the fastest or estimate journey duration; the route is chosen
+      by fewest line changes, then fewest station hops, not by elapsed time.
+    - State the network-draft warning in one brief sentence in the actual answer; do not omit it.
+    - Include relevant user_facing_warnings in the natural-language answer, especially station-specific restrictions and the draft-network caveat.
+    - If either endpoint is Kavi Subhash, state both restrictions distinctly when applicable:
+      (1) the supplied network lists the Kavi Subhash–Beleghata Orange Line section, which may
+      be suspended for the requested date; and (2) Blue Line passenger service at Kavi Subhash
+      is separately listed as suspended, with Shahid Khudiram as the Blue Line passenger terminal.
+      Never claim that Kavi Subhash is only on the Orange Line, and never conflate these restrictions.
+      When returned, preserve the explicit Blue Line restriction sentence in user_facing_summary.
+    - For pandal endpoints, explain that the nearest-station link uses straight-line distance;
+      walking directions and real walking distance are not provided.
+    - If a line is suspended or its schedule is unconfirmed, put that limitation near the top.
+    - End with a brief note to check Metro Railway for amendments or live disruptions.
+    - Prefer user_facing_summary, user_facing_steps, and user_facing_warnings over technical fields.
+    """
+    raw_origin = str(origin or "").strip()
+    raw_destination = str(destination or "").strip()
+    if not raw_origin or not raw_destination:
+        return {"status": "error", "error": "Both origin and destination are required."}
+
+    date_was_defaulted = not str(travel_date or "").strip()
+    raw_date = str(travel_date or "").strip()
+    if date_was_defaulted:
+        raw_date = datetime.now(KOLKATA_TIMEZONE).date().isoformat()
+    try:
+        requested_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+        if requested_date.isoformat() != raw_date:
+            raise ValueError
+    except (TypeError, ValueError):
+        return {"status": "error", "error": "travel_date must use YYYY-MM-DD format, for example 2026-10-18."}
+
+    friendly_travel_date = requested_date.strftime("%d %B %Y").lstrip("0")
+
+    network = _load_metro_network_for_route_planner()
+    if "_error" in network:
+        return {"status": "unavailable", "error": network["_error"]}
+
+    network_stations = [s for s in network.get("stations", []) if isinstance(s, dict) and s.get("id") and s.get("name")]
+    line_records = [l for l in network.get("lines", []) if isinstance(l, dict) and l.get("line_id") and l.get("line_name")]
+    if not network_stations or not line_records:
+        return {"status": "unavailable", "error": "Metro network file contains no usable stations or lines."}
+
+    station_by_id = {str(s["id"]).strip(): s for s in network_stations}
+    line_name_by_id = _metro_line_name_map(network)
+    line_record_by_id = {str(l["line_id"]).strip().upper(): l for l in line_records}
+    line_state_by_id = {}
+    route_warnings = []
+
+    network_status = str(network.get("status", "unknown"))
+    network_draft_notice = ""
+    if network_status.upper() in {"DRAFT_FOR_REVIEW", "DRAFT", "UNVERIFIED"}:
+        network_draft_notice = (
+            "This route uses a draft Metro station network that has not been fully "
+            "verified; confirm the station sequence and interchange with Metro Railway "
+            "before travelling."
+        )
+        route_warnings.append(network_draft_notice)
+
+    special_coverage = metro_puja_special_services_data.get("coverage", {})
+    coverage_start = str(special_coverage.get("start_date", ""))
+    coverage_end = str(special_coverage.get("end_date", ""))
+    in_special_coverage = bool(coverage_start and coverage_end and coverage_start <= raw_date <= coverage_end)
+
+    blocked_base_statuses = {"closed", "suspended", "not_operational", "under_construction", "not_commissioned"}
+    active_line_ids = set()
+    line_service_details = {}
+    for line_id, line_record in line_record_by_id.items():
+        base_status = str(line_record.get("status", "operational")).casefold()
+        state = _metro_schedule_state_for_date(line_record.get("line_name", ""), raw_date, network)
+        status = str(state.get("status", "unknown")).casefold()
+        line_state_by_id[line_id] = state
+        if status == "suspended":
+            continue
+        if base_status in blocked_base_statuses:
+            continue
+        active_line_ids.add(line_id)
+        period = state.get("period") if isinstance(state.get("period"), dict) else {}
+        line_service_details[line_id] = {
+            "line_id": line_id,
+            "line_name": line_record.get("line_name"),
+            "service_status_on_date": "scheduled" if status == "scheduled" else "not_confirmed_by_special_schedule",
+            "service_window_start": period.get("service_window_start"),
+            "service_window_end": period.get("service_window_end"),
+            "service_window_end_day_offset": period.get("service_window_end_day_offset"),
+            "peak_frequency_minutes": period.get("peak_frequency_minutes"),
+            "daily_services_total": period.get("daily_services_total"),
+            "schedule_source": state.get("source"),
+        }
+        if status != "scheduled":
+            route_warnings.append(
+                f"No matching special-service schedule confirms {line_record.get('line_name')} for {raw_date}; the route uses the static network layout only."
+            )
+
+    if not in_special_coverage:
+        route_warnings.append(
+            f"The supplied Puja special-service notice covers {coverage_start or 'an unspecified start date'} to {coverage_end or 'an unspecified end date'} only; normal operating hours for {raw_date} are not provided."
+        )
+
+    # Exclude station/line pairs affected by permanent or long-running advisories,
+    # such as Blue Line passenger service at Kavi Subhash.
+    blocked_station_line_pairs = set()
+    effective_station_line_advisories = []
+    for advisory in network.get("temporary_service_advisories", []):
+        if not isinstance(advisory, dict):
+            continue
+        if advisory.get("type") == "station_line_closure":
+            start = str(advisory.get("effective_from", ""))
+            end = str(advisory.get("effective_to", "9999-12-31"))
+            if not start or start <= raw_date <= end:
+                station_id = str(advisory.get("station_id", "")).strip()
+                line_id = str(advisory.get("line_id", "")).strip().upper()
+                blocked_station_line_pairs.add((station_id, line_id))
+                effective_station_line_advisories.append(advisory)
+
+    # Compatibility fallback for the currently supplied draft network. That JSON
+    # has no temporary_service_advisories entry, although its Blue Line special-
+    # service records list Shahid Khudiram as a terminal and omit Kavi Subhash.
+    # Only infer a station/line closure when all the evidence below agrees:
+    #   * the requested date has an explicitly scheduled Blue Line period;
+    #   * the period's first/last service records include Shahid Khudiram;
+    #   * those terminal records do not include Kavi Subhash; and
+    #   * Kavi Subhash appears after Shahid Khudiram in the draft Blue Line order.
+    # An explicit, date-effective network advisory always takes precedence.
+    has_explicit_kavi_blue_advisory = any(
+        str(item.get("line_id", "")).strip().upper() == "BLUE"
+        and _metro_normalize_name(item.get("station_name", "")) == "kavi subhash"
+        for item in effective_station_line_advisories
+    )
+    if not has_explicit_kavi_blue_advisory:
+        blue_state = line_state_by_id.get("BLUE", {})
+        blue_period = blue_state.get("period")
+        blue_line_record = line_record_by_id.get("BLUE", {})
+        blue_station_order = [str(value).strip() for value in blue_line_record.get("station_ids", [])]
+        kavi_station = next(
+            (
+                station for station in network_stations
+                if _metro_normalize_name(station.get("name", "")) == "kavi subhash"
+                and "BLUE" in {
+                    str(value).strip().upper()
+                    for value in station.get("line_ids", station.get("operational_line_ids", []))
+                }
+            ),
+            None,
+        )
+        shahid_station = next(
+            (
+                station for station in network_stations
+                if _metro_normalize_name(station.get("name", "")) == "shahid khudiram"
+            ),
+            None,
+        )
+        if (
+            str(blue_state.get("status", "")).casefold() == "scheduled"
+            and isinstance(blue_period, dict)
+            and isinstance(kavi_station, dict)
+            and isinstance(shahid_station, dict)
+        ):
+            terminal_records = []
+            for key in ("first_services", "last_services"):
+                rows = blue_period.get(key, [])
+                if isinstance(rows, list):
+                    terminal_records.extend(row for row in rows if isinstance(row, dict))
+            terminal_names = {
+                _metro_normalize_name(row.get(field, ""))
+                for row in terminal_records
+                for field in ("from", "to")
+                if row.get(field)
+            }
+            kavi_id = str(kavi_station.get("id", "")).strip()
+            shahid_id = str(shahid_station.get("id", "")).strip()
+            try:
+                kavi_position = blue_station_order.index(kavi_id)
+                shahid_position = blue_station_order.index(shahid_id)
+            except ValueError:
+                kavi_position = shahid_position = -1
+            if (
+                "shahid khudiram" in terminal_names
+                and "kavi subhash" not in terminal_names
+                and shahid_position >= 0
+                and kavi_position > shahid_position
+                and (kavi_id, "BLUE") not in blocked_station_line_pairs
+            ):
+                inferred_advisory = {
+                    "type": "station_line_closure",
+                    "station_id": kavi_id,
+                    "station_name": "Kavi Subhash",
+                    "line_id": "BLUE",
+                    "status": "passenger_service_suspended",
+                    "effective_from": raw_date,
+                    "effective_to": raw_date,
+                    "source": "metro_puja_special_services_2026.json",
+                    "passenger_terminal_station_name": str(shahid_station.get("name", "Shahid Khudiram")),
+                    "reason": (
+                        "The scheduled Blue Line first/last service records list Shahid Khudiram "
+                        "as a terminal and do not list Kavi Subhash as a Blue Line terminal."
+                    ),
+                }
+                blocked_station_line_pairs.add((kavi_id, "BLUE"))
+                effective_station_line_advisories.append(inferred_advisory)
+
+    # Construct a graph whose nodes are (station, line), so transfers occur only
+    # at explicit interchange stations listed by the reviewed network dataset.
+    adjacency = {}
+    usable_station_ids = set()
+    usable_connections = 0
+    for connection in network.get("connections", []):
+        if not isinstance(connection, dict):
+            continue
+        line_id = str(connection.get("line_id", "")).strip().upper()
+        start_id = str(connection.get("from_station_id", "")).strip()
+        end_id = str(connection.get("to_station_id", "")).strip()
+        if line_id not in active_line_ids or start_id not in station_by_id or end_id not in station_by_id:
+            continue
+        if connection.get("operational_as_of_map") is False:
+            continue
+        if (start_id, line_id) in blocked_station_line_pairs or (end_id, line_id) in blocked_station_line_pairs:
+            continue
+        direction = str(connection.get("travel_direction", "both")).casefold()
+        a, b = (start_id, line_id), (end_id, line_id)
+        adjacency.setdefault(a, [])
+        adjacency.setdefault(b, [])
+        adjacency[a].append((b, "ride"))
+        if direction in {"both", "reverse", "backward", "two_way", "two-way"}:
+            adjacency[b].append((a, "ride"))
+        usable_station_ids.update((start_id, end_id))
+        usable_connections += 1
+
+    # Add transfer edges only at explicit interchanges, and only for line states
+    # that have actual available ride edges for the requested date.
+    for interchange in network.get("interchanges", []):
+        if not isinstance(interchange, dict):
+            continue
+        station_id = str(interchange.get("station_id", "")).strip()
+        operational_line_ids = [str(v).strip().upper() for v in interchange.get("operational_line_ids", [])]
+        states = [
+            (station_id, lid) for lid in operational_line_ids
+            if lid in active_line_ids and (station_id, lid) in adjacency
+            and (station_id, lid) not in {pair for pair in blocked_station_line_pairs}
+        ]
+        for i, state_a in enumerate(states):
+            for state_b in states[i + 1:]:
+                adjacency[state_a].append((state_b, "transfer"))
+                adjacency[state_b].append((state_a, "transfer"))
+
+    start_resolved = _metro_resolve_endpoint(raw_origin, network_stations, usable_station_ids)
+    if start_resolved.get("status") != "found":
+        return {"status": start_resolved.get("status", "not_found"), "error": start_resolved.get("message", f"Could not resolve origin '{raw_origin}'."), "candidates": start_resolved.get("candidates", []), "travel_date": raw_date}
+    end_resolved = _metro_resolve_endpoint(raw_destination, network_stations, usable_station_ids)
+    if end_resolved.get("status") != "found":
+        return {"status": end_resolved.get("status", "not_found"), "error": end_resolved.get("message", f"Could not resolve destination '{raw_destination}'."), "candidates": end_resolved.get("candidates", []), "travel_date": raw_date}
+
+    start_station_id = str(start_resolved.get("station_id", ""))
+    end_station_id = str(end_resolved.get("station_id", ""))
+
+    # Convert relevant station/line advisories into clear user-facing notices.
+    # Keep station closures distinct from whole-line suspensions.
+    endpoint_station_ids = {start_station_id, end_station_id}
+    user_facing_station_restrictions = []
+    for advisory in effective_station_line_advisories:
+        advisory_station_id = str(advisory.get("station_id", "")).strip()
+        line_id = str(advisory.get("line_id", "")).strip().upper()
+        if advisory_station_id not in endpoint_station_ids:
+            continue
+        station_name = (
+            station_by_id.get(advisory_station_id, {}).get("name")
+            or advisory.get("station_name")
+            or advisory_station_id
+        )
+        line_name = line_name_by_id.get(line_id, line_id or "Metro line")
+        status_text = str(advisory.get("status", "")).casefold()
+        if status_text in {"passenger_service_suspended", "suspended", "closed"}:
+            note = f"{line_name} passenger service is listed as suspended at {station_name}."
+        else:
+            note = f"The supplied network marks {line_name} service at {station_name} as restricted."
+
+        # Prefer a date-specific terminal inferred from the special-service notice.
+        # The draft network's Blue Line station_ids currently ends at Kavi Subhash,
+        # so blindly using its final station would contradict the passenger-service
+        # restriction derived above. Only fall back to station_ids for advisories
+        # that do not carry an explicit terminal name.
+        if line_id == "BLUE":
+            terminal_name = str(advisory.get("passenger_terminal_station_name") or "").strip()
+            if not terminal_name:
+                blue_record = line_record_by_id.get("BLUE", {})
+                blue_station_ids = [str(x) for x in blue_record.get("station_ids", [])]
+                terminal_id = blue_station_ids[-1] if blue_station_ids else ""
+                terminal_name = station_by_id.get(terminal_id, {}).get("name")
+            if terminal_name:
+                note += f" {terminal_name} is listed as the Blue Line passenger terminal."
+                note += " This Blue Line restriction is separate from Orange Line service status."
+        if note not in user_facing_station_restrictions:
+            user_facing_station_restrictions.append(note)
+
+    user_facing_common_warnings = []
+    if network_draft_notice:
+        user_facing_common_warnings.append(network_draft_notice)
+    user_facing_common_warnings.extend(user_facing_station_restrictions)
+
+    start_states = [state for state in adjacency if state[0] == start_station_id]
+    end_states = {state for state in adjacency if state[0] == end_station_id}
+
+    # If the endpoint's only lines are suspended, return the reason explicitly.
+    def suspended_lines_at_station(station_id: str) -> list[str]:
+        line_ids = set()
+        station = station_by_id.get(station_id, {})
+        for lid in station.get("line_ids", station.get("operational_line_ids", [])):
+            state = _metro_schedule_state_for_date(line_name_by_id.get(str(lid).upper(), str(lid)), raw_date, network)
+            if str(state.get("status", "")).casefold() == "suspended":
+                line_ids.add(line_name_by_id.get(str(lid).upper(), str(lid)))
+        for line_id, line in line_record_by_id.items():
+            if station_id in [str(x) for x in line.get("station_ids", [])]:
+                state = line_state_by_id.get(line_id, {})
+                if str(state.get("status", "")).casefold() == "suspended":
+                    line_ids.add(line.get("line_name", line_id))
+        return sorted(line_ids)
+
+    if not start_states or not end_states:
+        unavailable_lines = sorted(set(suspended_lines_at_station(start_station_id) + suspended_lines_at_station(end_station_id)))
+        restriction_reasons = list(user_facing_station_restrictions)
+
+        # Explain any suspended line that serves one of the endpoints separately
+        # from a station-specific closure (for example, Orange suspension vs the
+        # Blue Line passenger-service closure at Kavi Subhash).
+        endpoint_line_suspensions = []
+        endpoint_ids_and_names = (
+            (start_station_id, str(start_resolved.get("name") or "origin")),
+            (end_station_id, str(end_resolved.get("name") or "destination")),
+        )
+        for line_name in unavailable_lines:
+            line_id = next(
+                (lid for lid, name in line_name_by_id.items() if _metro_normalize_name(name) == _metro_normalize_name(line_name)),
+                "",
+            )
+            line_record = line_record_by_id.get(line_id, {})
+            line_station_ids = {str(x) for x in line_record.get("station_ids", [])}
+            connected_endpoint_names = []
+            # Include stations declared by the station record as well, because
+            # endpoint stations may not be present on the active ride graph.
+            for sid, endpoint_name in endpoint_ids_and_names:
+                station = station_by_id.get(sid, {})
+                endpoint_line_ids = {
+                    str(x).strip().upper()
+                    for x in station.get("line_ids", station.get("operational_line_ids", []))
+                }
+                if (sid in line_station_ids or line_id in endpoint_line_ids) and endpoint_name not in connected_endpoint_names:
+                    connected_endpoint_names.append(endpoint_name)
+            if connected_endpoint_names:
+                if len(connected_endpoint_names) == 2:
+                    endpoint_list = f"both {connected_endpoint_names[0]} and {connected_endpoint_names[1]}"
+                else:
+                    endpoint_list = connected_endpoint_names[0]
+                endpoint_line_suspensions.append(
+                    f"Separately, the {line_name} is listed as suspended on {friendly_travel_date}. "
+                    f"The supplied network shows {endpoint_list} on that line."
+                )
+        restriction_reasons.extend(endpoint_line_suspensions)
+
+        # Keep the Kavi Subhash restrictions explicit in the primary message.
+        # Kavi Subhash is the Orange Line endpoint in this network, while its
+        # Blue Line passenger service is separately listed as suspended.
+        resolved_endpoint_names = {
+            _metro_normalize_name(start_resolved.get("name", "")),
+            _metro_normalize_name(end_resolved.get("name", "")),
+        }
+        kavi_subhash_is_endpoint = "kavi subhash" in resolved_endpoint_names
+        blue_kavi_restriction_note = ""
+        if kavi_subhash_is_endpoint:
+            has_kavi_blue_advisory = any(
+                str(advisory.get("station_id", "")).strip() == start_station_id
+                or str(advisory.get("station_id", "")).strip() == end_station_id
+                for advisory in effective_station_line_advisories
+                if str(advisory.get("line_id", "")).strip().upper() == "BLUE"
+                and str(advisory.get("station_name", "")).strip().casefold() == "kavi subhash"
+            )
+            if has_kavi_blue_advisory:
+                blue_kavi_restriction_note = (
+                    "Separately, Blue Line passenger service at Kavi Subhash is listed as suspended; "
+                    "the supplied draft network lists Shahid Khudiram as the Blue Line passenger terminal. "
+                    "This Blue Line restriction is distinct from the Orange Line suspension."
+                )
+                if not any(
+                    "blue line" in reason.casefold()
+                    and "kavi subhash" in reason.casefold()
+                    and "suspend" in reason.casefold()
+                    for reason in restriction_reasons
+                ):
+                    restriction_reasons.append(blue_kavi_restriction_note)
+
+        if unavailable_lines:
+            message = (
+                "No Metro-only route is available for "
+                f"{start_resolved.get('name')} to {end_resolved.get('name')} on {friendly_travel_date}. "
+                "The required line is listed as suspended: " + ", ".join(unavailable_lines) + "."
+            )
+        else:
+            message = (
+                "No Metro-only route is available between these endpoints on "
+                f"{friendly_travel_date} in the supplied station network."
+            )
+
+        # Make the distinction visible even if a client displays `message`
+        # instead of the richer `user_facing_summary` field.
+        if blue_kavi_restriction_note:
+            message += " " + blue_kavi_restriction_note
+
+        user_facing_summary = (
+            f"No Metro-only route is available from {start_resolved.get('name')} "
+            f"to {end_resolved.get('name')} on {friendly_travel_date}."
+        )
+        if restriction_reasons:
+            user_facing_summary += " " + " ".join(restriction_reasons)
+        elif unavailable_lines:
+            user_facing_summary += (
+                " The supplied service data lists these required lines as suspended: "
+                + ", ".join(unavailable_lines) + "."
+            )
+        if network_draft_notice:
+            user_facing_summary += " " + network_draft_notice
+        user_facing_summary += " Check Metro Railway for any newer official notice before travelling."
+        return {
+            "status": "no_route_for_date",
+            "origin": {"name": start_resolved.get("name"), "station_id": start_station_id, "type": start_resolved.get("type")},
+            "destination": {"name": end_resolved.get("name"), "station_id": end_station_id, "type": end_resolved.get("type")},
+            "travel_date": raw_date,
+            "unavailable_lines": unavailable_lines,
+            "message": message,
+            "user_facing_summary": user_facing_summary,
+            "user_facing_restrictions": restriction_reasons,
+            "user_facing_warnings": user_facing_common_warnings + endpoint_line_suspensions,
+            "user_facing_next_step": (
+                "Check Metro Railway's latest notice and use a non-Metro option such as a bus, auto, or taxi if the suspension remains in effect. "
+                "This tool does not calculate bus or walking connections."
+            ),
+            "warnings": route_warnings,
+            "recommendation": "Use another available transport option or check for a later official service notice; the planner will not recommend a suspended line.",
+        }
+
+    if start_station_id == end_station_id:
+        same_station_access = {}
+        for endpoint_key, resolved in (("origin_access", start_resolved), ("destination_access", end_resolved)):
+            if resolved.get("type") == "pandal":
+                same_station_access[endpoint_key] = {
+                    "pandal_name": resolved.get("name"),
+                    "nearest_metro_station": resolved.get("nearest_metro_station"),
+                    "distance_km_straight_line": resolved.get("access_distance_km_straight_line"),
+                    "note": resolved.get("access_distance_note"),
+                }
+        return {
+            "status": "success",
+            "travel_date": raw_date,
+            "travel_date_defaulted": date_was_defaulted,
+            "timezone": "Asia/Kolkata",
+            "origin": {"input": raw_origin, "name": start_resolved.get("name"), "station_id": start_station_id, "type": start_resolved.get("type")},
+            "destination": {"input": raw_destination, "name": end_resolved.get("name"), "station_id": end_station_id, "type": end_resolved.get("type")},
+            "route_summary": "Origin and destination resolve to the same Metro station; no Metro ride is needed.",
+            "user_facing_summary": (
+                f"Both endpoints connect to {station_by_id[start_station_id].get('name', start_station_id)}. "
+                "No Metro ride or line change is needed between them."
+            ),
+            "user_facing_steps": [
+                "Use the same Metro station for both endpoints; no train journey is needed."
+            ],
+            "segments": [], "transfers": [], "station_sequence": [{"id": start_station_id, "name": station_by_id[start_station_id].get("name")}],
+            "warnings": route_warnings,
+            "user_facing_warnings": user_facing_common_warnings,
+            **same_station_access,
+        }
+
+    # Dijkstra with lexicographic cost: minimize interchanges first, then rail hops.
+    best_cost = {}
+    previous = {}
+    heap = []
+    for state in start_states:
+        best_cost[state] = (0, 0)
+        heapq.heappush(heap, (0, 0, state[0], state[1]))
+    end_state = None
+    while heap:
+        transfers, stops, station_id, line_id = heapq.heappop(heap)
+        state = (station_id, line_id)
+        if best_cost.get(state) != (transfers, stops):
+            continue
+        if state in end_states:
+            end_state = state
+            break
+        for neighbor, edge_type in adjacency.get(state, []):
+            extra_transfer = 1 if edge_type == "transfer" else 0
+            extra_stop = 1 if edge_type == "ride" else 0
+            candidate = (transfers + extra_transfer, stops + extra_stop)
+            if candidate < best_cost.get(neighbor, (10**9, 10**9)):
+                best_cost[neighbor] = candidate
+                previous[neighbor] = (state, edge_type)
+                heapq.heappush(heap, (candidate[0], candidate[1], neighbor[0], neighbor[1]))
+
+    if end_state is None:
+        unavailable_lines = sorted(set(suspended_lines_at_station(start_station_id) + suspended_lines_at_station(end_station_id)))
+        possible_lines = sorted({str(x.get("line_name", "")) for x in line_records if str(x.get("line_id", "")).upper() in active_line_ids})
+        return {
+            "status": "no_metro_only_route",
+            "travel_date": raw_date,
+            "origin": {"name": start_resolved.get("name"), "station_id": start_station_id, "type": start_resolved.get("type")},
+            "destination": {"name": end_resolved.get("name"), "station_id": end_station_id, "type": end_resolved.get("type")},
+            "unavailable_lines_at_endpoints": unavailable_lines,
+            "message": "No Metro-only path connects these endpoints in the supplied network for this date. A bus or walking connection may be needed, but is not calculated by this tool.",
+            "user_facing_summary": (
+                "I couldn't find a connected Metro-only route between these endpoints "
+                "for the selected date in the current station network. A bus or walking "
+                "connection may be needed; this tool does not calculate those connections."
+            ),
+            "user_facing_next_step": "Try another pair of stations or ask for a separate walking/driving route.",
+            "available_line_names_in_graph": possible_lines,
+            "warnings": route_warnings,
+        }
+
+    path_states = [end_state]
+    while path_states[-1] not in start_states:
+        prev = previous.get(path_states[-1])
+        if prev is None:
+            break
+        path_states.append(prev[0])
+    path_states.reverse()
+
+    # Convert state path into ride segments, with transfers at explicit interchanges.
+    segments = []
+    current_line = path_states[0][1]
+    current_ids = [path_states[0][0]]
+    for station_id, next_line in path_states[1:]:
+        if next_line == current_line:
+            if station_id != current_ids[-1]:
+                current_ids.append(station_id)
+        else:
+            segments.append({
+                "line_id": current_line,
+                "line_name": line_name_by_id.get(current_line, current_line),
+                "station_ids": current_ids[:],
+                "stations": [station_by_id[sid].get("name", sid) for sid in current_ids],
+                "from_station": station_by_id[current_ids[0]].get("name", current_ids[0]),
+                "to_station": station_by_id[current_ids[-1]].get("name", current_ids[-1]),
+                "station_to_station_hops": max(0, len(current_ids) - 1),
+                "service": line_service_details.get(current_line, {
+                    "line_id": current_line,
+                    "line_name": line_name_by_id.get(current_line, current_line),
+                    "service_status_on_date": "not_confirmed_by_special_schedule",
+                    "operating_window_start": None,
+                    "operating_window_end": None,
+                    "schedule_source": "static network only",
+                }),
+            })
+            current_line = next_line
+            current_ids = [station_id]
+    segments.append({
+        "line_id": current_line,
+        "line_name": line_name_by_id.get(current_line, current_line),
+        "station_ids": current_ids[:],
+        "stations": [station_by_id[sid].get("name", sid) for sid in current_ids],
+        "from_station": station_by_id[current_ids[0]].get("name", current_ids[0]),
+        "to_station": station_by_id[current_ids[-1]].get("name", current_ids[-1]),
+        "station_to_station_hops": max(0, len(current_ids) - 1),
+        "service": line_service_details.get(current_line, {
+            "line_id": current_line,
+            "line_name": line_name_by_id.get(current_line, current_line),
+            "service_status_on_date": "not_confirmed_by_special_schedule",
+            "operating_window_start": None,
+            "operating_window_end": None,
+            "schedule_source": "static network only",
+        }),
+    })
+
+    station_sequence_ids = []
+    for station_id, _line_id in path_states:
+        if not station_sequence_ids or station_sequence_ids[-1] != station_id:
+            station_sequence_ids.append(station_id)
+    station_sequence = [{"id": sid, "name": station_by_id[sid].get("name", sid)} for sid in station_sequence_ids]
+
+    transfers = []
+    for previous_segment, next_segment in zip(segments, segments[1:]):
+        transfer_station_id = previous_segment["station_ids"][-1]
+        if transfer_station_id == next_segment["station_ids"][0]:
+            transfers.append({
+                "station_id": transfer_station_id,
+                "station_name": station_by_id[transfer_station_id].get("name", transfer_station_id),
+                "from_line": previous_segment["line_name"],
+                "to_line": next_segment["line_name"],
+            })
+
+    endpoint_access = {}
+    for endpoint_key, resolved in (("origin_access", start_resolved), ("destination_access", end_resolved)):
+        if resolved.get("type") == "pandal":
+            endpoint_access[endpoint_key] = {
+                "pandal_name": resolved.get("name"),
+                "nearest_metro_station": resolved.get("nearest_metro_station"),
+                "distance_km_straight_line": resolved.get("access_distance_km_straight_line"),
+                "note": resolved.get("access_distance_note"),
+            }
+
+    route_line_names = [segment["line_name"] for segment in segments]
+    if len(segments) == 1:
+        route_summary = f"Take the {segments[0]['line_name']} from {segments[0]['from_station']} to {segments[0]['to_station']}."
+    else:
+        route_summary = "Take " + " then ".join(route_line_names) + "; change lines at " + ", ".join(t["station_name"] for t in transfers) + "."
+
+    # Build concise, readable route steps for the model to present directly.
+    user_facing_steps = []
+    if start_resolved.get("type") == "pandal":
+        user_facing_steps.append(
+            f"From {start_resolved.get('name')}, reach {start_resolved.get('nearest_metro_station')} Metro station. "
+            f"The approximate straight-line distance is {start_resolved.get('access_distance_km_straight_line')} km; "
+            "actual walking directions and walking distance are not available here."
+        )
+    for index, segment in enumerate(segments):
+        stations_on_segment = segment.get("stations", [])
+        step = (
+            f"Take the {segment['line_name']} from {segment['from_station']} "
+            f"to {segment['to_station']}."
+        )
+        if len(stations_on_segment) > 2:
+            via = stations_on_segment[1:-1]
+            intermediate_count = len(via)
+            noun = "station" if intermediate_count == 1 else "stations"
+            step += (
+                f" Pass {intermediate_count} intermediate {noun}: "
+                + ", ".join(via)
+                + f"; then arrive at {segment['to_station']} after "
+                f"{segment['station_to_station_hops']} station-to-station hops."
+            )
+        elif segment.get("station_to_station_hops", 0) > 0:
+            step += f" This is {segment['station_to_station_hops']} station-to-station hop."
+        user_facing_steps.append(step)
+        if index < len(transfers):
+            transfer = transfers[index]
+            user_facing_steps.append(
+                f"At {transfer['station_name']}, change from the {transfer['from_line']} "
+                f"to the {transfer['to_line']}."
+            )
+    if end_resolved.get("type") == "pandal":
+        user_facing_steps.append(
+            f"From {end_resolved.get('nearest_metro_station')} Metro station to {end_resolved.get('name')}, "
+            f"the straight-line distance is about {end_resolved.get('access_distance_km_straight_line')} km. "
+            "Walking directions are not included."
+        )
+
+    schedule_known = all(segment.get("service", {}).get("service_status_on_date") == "scheduled" for segment in segments)
+    unique_line_services = {}
+    for segment in segments:
+        service = segment.get("service", {})
+        line_id = str(service.get("line_id") or segment.get("line_id") or "").upper()
+        if line_id and line_id not in unique_line_services:
+            unique_line_services[line_id] = service
+    user_facing_service_notes = [
+        _metro_user_facing_service_note(service, raw_date)
+        for service in unique_line_services.values()
+    ]
+    if not schedule_known:
+        route_warnings.append("A station path was found, but the supplied special-service notice does not confirm every line for this date. Check the published timetable before travelling.")
+    route_warnings.append("This is a station-to-station route suggestion, not live train status. Exact departure times, fares, and total journey duration are not available here.")
+
+    return {
+        "status": "success",
+        "tool": "plan_metro_journey",
+        "travel_date": raw_date,
+        "travel_date_defaulted": date_was_defaulted,
+        "timezone": "Asia/Kolkata",
+        "origin": {"input": raw_origin, "name": start_resolved.get("name"), "station_id": start_station_id, "type": start_resolved.get("type")},
+        "destination": {"input": raw_destination, "name": end_resolved.get("name"), "station_id": end_station_id, "type": end_resolved.get("type")},
+        "route_summary": route_summary,
+        "user_facing_summary": (
+            f"A Metro-only route is available from {start_resolved.get('name')} to {end_resolved.get('name')} on {friendly_travel_date}: {route_summary}"
+            + (
+                f" I assumed the travel date is {raw_date} in Kolkata time because no date was provided."
+                if date_was_defaulted else ""
+            )
+            + (" " + network_draft_notice if network_draft_notice else "")
+            + (" " + " ".join(user_facing_station_restrictions) if user_facing_station_restrictions else "")
+            + " Check Metro Railway for any later official amendments or live disruptions."
+        ),
+        "user_facing_steps": user_facing_steps,
+        "user_facing_warnings": user_facing_common_warnings + [
+            "This is a station-to-station route suggestion, not live train status. Exact departure times, fares, and total journey duration are not available here."
+        ],
+        "user_facing_service_notes": user_facing_service_notes,
+        "user_facing_transfer_summary": (
+            "No line changes are needed." if not transfers else
+            "Line changes: " + "; ".join(
+                f"change from {t['from_line']} to {t['to_line']} at {t['station_name']}"
+                for t in transfers
+            ) + "."
+        ),
+        "route_selection": "Fewest line changes, then fewest station-to-station hops; not optimized for elapsed travel time.",
+        "station_count_including_endpoints": len(station_sequence),
+        "station_to_station_hops": max(0, len(station_sequence) - 1),
+        "transfers_count": len(transfers),
+        "transfers": transfers,
+        "segments": segments,
+        "station_sequence": station_sequence,
+        "line_service_check": [line_service_details.get(seg["line_id"], seg["service"]) for seg in segments],
+        "network_source": network.get("primary_source", {}),
+        "network_status": network_status,
+        "service_schedule_source": metro_puja_special_services_data.get("source", {}),
+        "warnings": list(dict.fromkeys(route_warnings)),
+        "limitations": [
+            "No exact train-by-train timetable, fare, live delay, or journey duration is available in these files.",
+            "Special-service information is date-specific and may be amended by Metro Railway.",
+            "The Purple Line is isolated in this Metro-only graph; no bus, rail, or walking transfer connection to other lines is defined.",
+            "For pandal endpoints, nearest-station access is a straight-line distance, not a walking route.",
+        ],
+        **endpoint_access,
+    }
+
+
+
 
 @mcp.tool()
 def get_nearby_pandal_official_pages(
